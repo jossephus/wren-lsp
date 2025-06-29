@@ -6,35 +6,46 @@ pub fn build(b: *std.Build) !void {
 
     const lsp = buildLsp(b, target, optimize);
 
-    const wrenalyzer = build_wren_analyzer(b, target, optimize);
+    b.installArtifact(lsp);
 
-    b.installArtifact(wrenalyzer);
+    const exe_mod = b.addModule("wrenalyzer", .{
+        .root_source_file = b.path("src/wrenalyzer/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const run_cmd = b.addRunArtifact(lsp);
+    const testWrenAnalyzer = b.addExecutable(.{ .name = "test-wrenalyzer", .root_module = exe_mod });
+
+    const test_step = b.step("test", "Run test wrenalyzer");
+    test_step.dependOn(&testWrenAnalyzer.step);
+    b.installArtifact(testWrenAnalyzer);
+
+    const run_cmd = b.addRunArtifact(testWrenAnalyzer);
     run_cmd.step.dependOn(b.getInstallStep());
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 }
 
-fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Mode) *std.Build.Step.Compile {
+fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Mode) *std.Build.Module {
     _ = .{ b, target, optimize };
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/wrenalyzer/main.zig"),
+    const exe_mod = b.addModule("wrenalyzer", .{
+        .root_source_file = b.path("src/wrenalyzer/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const exe = b.addExecutable(.{
-        .name = "wren-lsp",
-        .root_module = exe_mod,
-    });
+    //const exe = b.addExecutable(.{
+    //.name = "wren-lsp",
+    //.root_module = exe_mod,
+    //});
 
-    return exe;
+    return exe_mod;
 }
 
 fn buildLsp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Mode) *std.Build.Step.Compile {
     const lsp = b.dependency("lsp_kit", .{});
+    const wrenalyzer = build_wren_analyzer(b, target, optimize);
 
     //const module = b.addModule(
     //"lsp",
@@ -54,6 +65,7 @@ fn buildLsp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("wrenalyzer", wrenalyzer);
 
     exe_mod.addImport("lsp", lsp.module("lsp"));
 

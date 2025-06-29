@@ -5,7 +5,7 @@ const Handler = lsp_namespace.Handler;
 const getRange = lsp_namespace.getRange;
 const Document = @import("Document.zig");
 
-const log = std.log.scoped(.ziggy_lsp);
+const log = std.log.scoped(.wren_lsp);
 
 pub fn loadFile(
     self: *Handler,
@@ -14,10 +14,9 @@ pub fn loadFile(
     uri: []const u8,
     language: lsp_namespace.Language,
 ) !void {
-    _ = arena;
     errdefer @panic("error while loading document!");
 
-    const res: lsp.types.PublishDiagnosticsParams = .{
+    var res: lsp.types.PublishDiagnosticsParams = .{
         .uri = uri,
         .diagnostics = &.{},
     };
@@ -28,7 +27,7 @@ pub fn loadFile(
         language,
     );
 
-    log.debug("document init", .{});
+    log.debug("document init changed", .{});
 
     const gop = try self.files.getOrPut(self.gpa, uri);
     errdefer _ = self.files.remove(uri);
@@ -41,20 +40,23 @@ pub fn loadFile(
 
     gop.value_ptr.* = doc;
 
-    //if (doc.html.errors.len != 0) {
-    //const diags = try arena.alloc(lsp.types.Diagnostic, doc.html.errors.len);
-    //for (doc.html.errors, diags) |err, *d| {
-    //const range = getRange(err.main_location, doc.src);
-    //d.* = .{
-    //.range = range,
-    //.severity = .Error,
-    //.message = switch (err.tag) {
-    //.token => |t| @tagName(t),
-    //.ast => |t| @tagName(t),
-    //},
-    //};
-    //}
-    //res.diagnostics = diags;
+    log.debug("document init changed {d}", .{doc.parser.errors.items.len});
+
+    if (doc.parser.errors.items.len != 0) {
+        const diags = try arena.alloc(lsp.types.Diagnostic, doc.parser.errors.items.len);
+
+        for (doc.parser.errors.items, diags) |err, *d| {
+            log.debug("Error is {s}", .{err.message});
+            const range = getRange(err.token);
+            d.* = .{
+                .range = range,
+                .severity = .Error,
+                .message = err.message,
+            };
+        }
+
+        res.diagnostics = diags;
+    }
     //} else {
     //if (doc.super_ast) |super_ast| {
     //const diags = try arena.alloc(

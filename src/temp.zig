@@ -1,15 +1,17 @@
 const std = @import("std");
-const Token = @import("token.zig").Token;
-const Lexer = @import("lexer.zig");
-const Parser = @import("parser.zig");
-const SourceFile = @import("source_file.zig");
-
-const source = @embedFile("test.wren");
+const wrenalyzer = @import("wrenalyzer");
+const Token = wrenalyzer.Token;
+const Lexer = wrenalyzer.Lexer;
+const Parser = wrenalyzer.Parser;
+const SourceFile = wrenalyzer.SourceFile;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const source_file = try SourceFile.new(allocator, "index.wren", source);
+    const source_file = try SourceFile.new(allocator, "index.wren",
+        \\ 1 +
+        \\  
+    );
     const lexer = try Lexer.new(allocator, source_file);
 
     var parser = try Parser.new(allocator, lexer);

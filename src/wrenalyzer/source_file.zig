@@ -4,6 +4,8 @@ const Chars = @import("chars.zig").Chars;
 
 pub const SourceFile = @This();
 
+pub const log = std.log.scoped(.wren_lsp);
+
 path: []const u8,
 code: []const u8,
 bytes: []const u8,
@@ -11,7 +13,7 @@ lines: []usize,
 allocator: std.mem.Allocator,
 
 pub fn new(allocator: std.mem.Allocator, path: []const u8, code: []const u8) !SourceFile {
-    const code_point_iterator = (try unicode.Utf8View.init(path)).iterator();
+    const code_point_iterator = (try unicode.Utf8View.init(code)).iterator();
 
     const bytes = code_point_iterator.bytes;
 
@@ -51,7 +53,7 @@ fn findLines(allocator: std.mem.Allocator, bytes: []const u8) ![]usize {
     try lines.append(0);
 
     for (bytes, 0..) |b, i| {
-        if (b == Chars.lineFeed.int()) {
+        if (b == '\n') {
             try lines.append(i + 1);
         }
     }

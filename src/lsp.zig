@@ -6,6 +6,7 @@ const offsets = lsp.offsets;
 const types = lsp.types;
 const ResultType = lsp.server.ResultType;
 const Message = lsp.server.Message;
+const Token = @import("wrenalyzer").Token;
 
 pub const Language = enum {
     wren,
@@ -132,6 +133,7 @@ pub const Handler = struct {
         arena: std.mem.Allocator,
         notification: types.DidOpenTextDocumentParams,
     ) !void {
+        log.debug("Opening document \n\n", .{});
         const new_text = try self.gpa.dupeZ(u8, notification.textDocument.text); // We informed the client that we only do full document syncs
         errdefer self.gpa.free(new_text);
 
@@ -368,3 +370,11 @@ pub const Handler = struct {
         log.warn("received response from client with id '{s}' that has no handler!", .{id});
     }
 };
+
+pub fn getRange(token: Token) lsp.types.Range {
+    const line = @as(u32, @intCast(token.source.lineAt(token.start)));
+    return .{
+        .start = .{ .line = line - 1, .character = @as(u32, @intCast(token.start)) },
+        .end = .{ .line = line - 1, .character = @as(u32, @intCast(token.start)) },
+    };
+}

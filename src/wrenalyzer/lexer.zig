@@ -311,6 +311,7 @@ pub fn initPunctuators(allocator: std.mem.Allocator) !std.AutoHashMap(Chars, []c
         .{ .char = Chars.dot },
         .{ .token = Token.Tag.dotDot },
         .{ .char = Chars.dot },
+        .{ .token = Token.Tag.dotDotDot },
     });
 
     return map;
