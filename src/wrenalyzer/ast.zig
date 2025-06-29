@@ -1,7 +1,7 @@
 const std = @import("std");
 const Token = @import("token.zig").Token;
 
-const NodeTag = enum { Module, AssignmentExpr, InfixExpr, PrefixExpr, NumExpr, NullExpr, GroupingExpr, ListExpr, MapExpr, BoolExpr, ThisExpr, FieldExpr, StaticFieldExpr, StringExpr, CallExpr, Body, SuperExpr, ClassStmt, Method, ImportStmt, VarStmt, BreakStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, BlockStmt };
+const NodeTag = enum { Module, AssignmentExpr, InfixExpr, PrefixExpr, NumExpr, NullExpr, GroupingExpr, ListExpr, MapExpr, BoolExpr, ThisExpr, FieldExpr, StaticFieldExpr, StringExpr, CallExpr, Body, SuperExpr, ClassStmt, Method, ImportStmt, VarStmt, BreakStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, BlockStmt, SubscriptExpr };
 
 pub const Node = union(NodeTag) {
     Module: *Module,
@@ -31,6 +31,7 @@ pub const Node = union(NodeTag) {
     WhileStmt: WhileStmt,
     ReturnStmt: ReturnStmt,
     BlockStmt: BlockStmt,
+    SubscriptExpr: SubscriptExpr,
 
     pub fn toString(self: Node) !void {
         var buf: [4096]u8 = undefined;
@@ -59,6 +60,7 @@ pub const Node = union(NodeTag) {
             .WhileStmt => |_while| try _while.toString(&buf),
             .ReturnStmt => |_return| try _return.toString(&buf),
             .BlockStmt => |_block| try _block.toString(&buf),
+            .SubscriptExpr => |_subscript| try _subscript.toString(&buf),
             else => {
                 std.debug.print("toString for {s} not implemented\n", .{@tagName(self)});
                 @panic("Quitting");
@@ -387,12 +389,12 @@ pub const StringExpr = struct {
 };
 
 pub const SubscriptExpr = struct {
-    receiver: Node,
-    leftBracket: []const u8,
-    arguments: []Node,
-    rightBracket: []const u8,
+    receiver: *Node,
+    leftBracket: ?Token,
+    arguments: []const Node,
+    rightBracket: ?Token,
 
-    pub fn init(recv: Node, lb: []const u8, args: []Node, rb: []const u8) SubscriptExpr {
+    pub fn init(recv: *Node, lb: ?Token, args: []const Node, rb: ?Token) SubscriptExpr {
         return .{
             .receiver = recv,
             .leftBracket = lb,
@@ -401,9 +403,9 @@ pub const SubscriptExpr = struct {
         };
     }
 
-    pub fn toString(self: *SubscriptExpr, buf: []u8) ![]u8 {
+    pub fn toString(self: SubscriptExpr, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Subscript({any} {s} {any} {s})", .{
+        try fbs.writer().print("Subscript({any} {any} {any} {any})", .{
             self.receiver, self.leftBracket, self.arguments, self.rightBracket,
         });
         return fbs.getWritten();

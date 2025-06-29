@@ -319,9 +319,22 @@ fn prefix(self: *Parser) ast.Node {
 }
 
 fn call(self: *Parser) ast.Node {
-    const expr = self.primary();
+    var expr = self.primary();
 
-    //while (true) {}
+    while (true) {
+        if (self.match(Tag.leftBracket) != null) {
+            const leftBracket = self.previous;
+            const arguments = self.argumentsList();
+            const rightBracket = self.consume(Tag.rightBracket, "Expect ']' after subscript arguments");
+            expr = .{ .SubscriptExpr = ast.SubscriptExpr.init(&expr, leftBracket, arguments, rightBracket) };
+        } else if (self.match(Tag.dot) != null) {
+            const name = self.consume(Tag.name, "Expect method name after '.'.");
+            expr = self.methodCall(&expr, name.?);
+        } else {
+            break;
+        }
+    }
+
     return expr;
 }
 
