@@ -7,9 +7,7 @@ const Tag = Token.Tag;
 const ast = @import("ast.zig");
 const Module = ast.Module;
 const Node = ast.Node;
-
-// In wrenalyzer it uses reporter class to report errors
-// Lets use a simple error struct to hold our errors to make it easy for now.
+const Reporter = @import("reporter.zig");
 
 pub const Error = struct {
     message: []const u8,
@@ -21,14 +19,20 @@ allocator: std.mem.Allocator,
 current: ?Token,
 previous: ?Token,
 errors: std.ArrayListUnmanaged(Error),
+reporter: ?*Reporter,
 
 pub fn new(allocator: std.mem.Allocator, lexer: Lexer) !Parser {
+    return newWithReporter(allocator, lexer, null);
+}
+
+pub fn newWithReporter(allocator: std.mem.Allocator, lexer: Lexer, reporter: ?*Reporter) !Parser {
     return .{
         .allocator = allocator,
         .lexer = lexer,
         .current = null,
         .previous = null,
         .errors = .empty,
+        .reporter = reporter,
     };
 }
 
@@ -673,10 +677,14 @@ pub fn parseInfix(self: *Parser, types: []const Tag, parseOperands: fn (parser: 
 }
 
 pub fn err(self: *Parser, message: []const u8) void {
-    //_ = self;
+    const error_token = if (self.current) |current| current else self.previous.?;
+
     self.errors.append(self.allocator, .{
         .message = message,
-        .token = if (self.current) |current| current else self.previous.?,
+        .token = error_token,
     }) catch @panic("Error adding to errors");
-    //std.debug.print("error: {s}\n", .{message});
+
+    if (self.reporter) |reporter| {
+        reporter.reportError(error_token, message);
+    }
 }

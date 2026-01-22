@@ -3,3 +3,7 @@ pub const Parser = @import("parser.zig").Parser;
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const Token = @import("token.zig").Token;
 pub const Ast = @import("ast.zig");
+pub const Reporter = @import("reporter.zig");
+pub const Scope = @import("scope.zig");
+pub const visitor = @import("visitor.zig");
+pub const Resolver = @import("resolver.zig");

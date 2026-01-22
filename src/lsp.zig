@@ -286,18 +286,23 @@ pub const Handler = struct {
 
         gop.value_ptr.* = doc;
 
-        log.debug("document errors: {d}", .{doc.parser.errors.items.len});
+        const reporter_diags = doc.getDiagnostics();
+        log.debug("document errors: {d}", .{reporter_diags.len});
 
-        if (doc.parser.errors.items.len != 0) {
-            const diags = try arena.alloc(types.Diagnostic, doc.parser.errors.items.len);
+        if (reporter_diags.len != 0) {
+            const diags = try arena.alloc(types.Diagnostic, reporter_diags.len);
 
-            for (doc.parser.errors.items, diags) |err, *d| {
-                log.debug("Error is {s}", .{err.message});
-                const range = getRange(err.token);
+            for (reporter_diags, diags) |rdiag, *d| {
+                log.debug("Error is {s}", .{rdiag.message});
                 d.* = .{
-                    .range = range,
-                    .severity = .Error,
-                    .message = err.message,
+                    .range = tokenToRange(rdiag.token),
+                    .severity = switch (rdiag.severity) {
+                        .@"error" => .Error,
+                        .warning => .Warning,
+                        .info => .Information,
+                        .hint => .Hint,
+                    },
+                    .message = rdiag.message,
                 };
             }
 
@@ -314,10 +319,21 @@ pub const Handler = struct {
     }
 };
 
-pub fn getRange(token: Token) types.Range {
-    const line = @as(u32, @intCast(token.source.lineAt(token.start)));
+pub fn tokenToRange(token: Token) types.Range {
+    const line_num = token.source.lineAt(token.start);
+    const line: u32 = if (line_num > 0) @intCast(line_num - 1) else 0;
+
+    const col_start = token.source.columnAt(token.start);
+    const col_end = token.source.columnAt(token.start + token.length);
+
     return .{
-        .start = .{ .line = if (line > 0) line - 1 else 0, .character = @as(u32, @intCast(token.start)) },
-        .end = .{ .line = if (line > 0) line - 1 else 0, .character = @as(u32, @intCast(token.start)) },
+        .start = .{
+            .line = line,
+            .character = if (col_start > 0) @intCast(col_start - 1) else 0,
+        },
+        .end = .{
+            .line = line,
+            .character = if (col_end > 0) @intCast(col_end - 1) else 0,
+        },
     };
 }
