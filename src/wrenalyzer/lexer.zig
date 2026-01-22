@@ -30,7 +30,7 @@ pub const KeyWords = std.StaticStringMap(Tag).initComptime(.{
 allocator: std.mem.Allocator,
 punctuators: std.AutoHashMap(Chars, []const Punc),
 source: SourceFile,
-interpolations: std.ArrayList(usize),
+interpolations: std.ArrayListUnmanaged(usize),
 start: usize,
 current: usize,
 
@@ -41,7 +41,7 @@ pub fn new(allocator: std.mem.Allocator, source: SourceFile) !Lexer {
         .source = source,
         .start = 0,
         .current = 0,
-        .interpolations = std.ArrayList(usize).init(allocator),
+        .interpolations = .empty,
     };
 }
 
@@ -224,7 +224,7 @@ fn readString(self: *Lexer) !Token {
             self.advance();
         } else if (c == Chars.percent.int()) {
             self.advance();
-            try self.interpolations.append(1);
+            try self.interpolations.append(self.allocator, 1);
             tag = Tag.interpolation;
             break;
         } else if (c == Chars.quote.int()) {

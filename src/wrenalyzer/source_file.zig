@@ -47,16 +47,16 @@ pub fn lineAt(self: SourceFile, offset: usize) usize {
 }
 
 fn findLines(allocator: std.mem.Allocator, bytes: []const u8) ![]usize {
-    var lines = std.ArrayList(usize).init(allocator);
-    defer lines.deinit();
+    var lines: std.ArrayListUnmanaged(usize) = .empty;
+    defer lines.deinit(allocator);
 
-    try lines.append(0);
+    try lines.append(allocator, 0);
 
     for (bytes, 0..) |b, i| {
         if (b == '\n') {
-            try lines.append(i + 1);
+            try lines.append(allocator, i + 1);
         }
     }
 
-    return lines.toOwnedSlice();
+    return lines.toOwnedSlice(allocator);
 }

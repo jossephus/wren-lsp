@@ -1,11 +1,11 @@
+//! Wren LSP Server implementation using lsp-kit
+
 const std = @import("std");
 const builtin = @import("builtin");
 
 const lsp = @import("lsp");
 const offsets = lsp.offsets;
 const types = lsp.types;
-const ResultType = lsp.server.ResultType;
-const Message = lsp.server.Message;
 const Token = @import("wrenalyzer").Token;
 
 pub const Language = enum {
@@ -26,39 +26,39 @@ pub const Language = enum {
 const Document = @import("lsp/Document.zig");
 
 pub const log = std.log.scoped(.wren_lsp);
-pub const WrenLsp = lsp.server.Server(Handler);
 
 pub const Handler = struct {
     gpa: std.mem.Allocator,
-    server: *WrenLsp,
+    transport: *lsp.Transport,
     files: std.StringHashMapUnmanaged(Document) = .{},
     offset_encoding: offsets.Encoding = .@"utf-16",
 
-    usingnamespace @import("lsp/logic.zig");
-
-    fn windowNotification(
-        self: *Handler,
-        lvl: types.MessageType,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) !void {
-        const txt = try std.fmt.allocPrint(self.gpa, fmt, args);
-        const msg = try self.server.sendToClientNotification(
-            "window/showMessage",
-            .{ .type = lvl, .message = txt },
-        );
-        defer self.gpa.free(msg);
+    pub fn init(gpa: std.mem.Allocator, transport: *lsp.Transport) Handler {
+        return .{
+            .gpa = gpa,
+            .transport = transport,
+        };
     }
 
     pub fn initialize(
         self: *Handler,
-        _: std.mem.Allocator,
-        request: types.InitializeParams,
-        offset_encoding_: offsets.Encoding,
-    ) !lsp.types.InitializeResult {
-        self.offset_encoding = offset_encoding_;
+        arena: std.mem.Allocator,
+        params: types.InitializeParams,
+    ) !types.InitializeResult {
+        _ = arena;
 
-        if (request.clientInfo) |clientInfo| {
+        if (params.capabilities.general) |general| {
+            if (general.positionEncodings) |encodings| {
+                for (encodings) |enc| {
+                    if (enc == .@"utf-8") {
+                        self.offset_encoding = .@"utf-8";
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (params.clientInfo) |clientInfo| {
             log.info("client is '{s}-{s}'", .{ clientInfo.name, clientInfo.version orelse "<no version>" });
         }
 
@@ -70,7 +70,7 @@ pub const Handler = struct {
                 .version = "0.0.1",
             },
             .capabilities = .{
-                .positionEncoding = switch (offset_encoding_) {
+                .positionEncoding = switch (self.offset_encoding) {
                     .@"utf-8" => .@"utf-8",
                     .@"utf-16" => .@"utf-16",
                     .@"utf-32" => .@"utf-32",
@@ -83,12 +83,12 @@ pub const Handler = struct {
                     },
                 },
                 .completionProvider = .{
-                    .triggerCharacters = &[_][]const u8{"<"},
+                    .triggerCharacters = &[_][]const u8{"."},
                 },
                 .hoverProvider = .{ .bool = false },
                 .definitionProvider = .{ .bool = false },
                 .referencesProvider = .{ .bool = false },
-                .documentFormattingProvider = .{ .bool = true },
+                .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
                         .full = .{ .bool = false },
@@ -104,277 +104,220 @@ pub const Handler = struct {
     }
 
     pub fn initialized(
-        self: *Handler,
+        _: *Handler,
         _: std.mem.Allocator,
-        notification: types.InitializedParams,
-    ) !void {
-        _ = self;
-        _ = notification;
-    }
+        _: types.InitializedParams,
+    ) !void {}
 
     pub fn shutdown(
-        _: Handler,
+        _: *Handler,
         _: std.mem.Allocator,
-        notification: void,
+        _: void,
     ) !?void {
-        _ = notification;
+        return null;
     }
 
-    pub fn exit(
-        _: Handler,
-        _: std.mem.Allocator,
-        notification: void,
-    ) !void {
-        _ = notification;
-    }
-
-    pub fn openDocument(
+    pub fn @"textDocument/didOpen"(
         self: *Handler,
         arena: std.mem.Allocator,
-        notification: types.DidOpenTextDocumentParams,
+        params: types.DidOpenTextDocumentParams,
     ) !void {
-        log.debug("Opening document \n\n", .{});
-        const new_text = try self.gpa.dupeZ(u8, notification.textDocument.text); // We informed the client that we only do full document syncs
+        log.debug("Opening document", .{});
+        const new_text = try self.gpa.dupeZ(u8, params.textDocument.text);
         errdefer self.gpa.free(new_text);
 
-        const language_id = notification.textDocument.languageId;
+        const language_id = params.textDocument.languageId;
         const language = Language.fromSliceResilient(language_id) orelse {
             log.err("unrecognized language id: '{s}'", .{language_id});
-            try self.windowNotification(
-                .Error,
-                "Unrecognized languageId, expected are: wren",
-                .{},
-            );
-            @panic("unrecognized language id, exiting");
+            return;
         };
         try self.loadFile(
             arena,
             new_text,
-            notification.textDocument.uri,
+            params.textDocument.uri,
             language,
         );
     }
 
-    pub fn changeDocument(
+    pub fn @"textDocument/didChange"(
         self: *Handler,
         arena: std.mem.Allocator,
-        notification: types.DidChangeTextDocumentParams,
+        params: types.DidChangeTextDocumentParams,
     ) !void {
-        errdefer |e| log.err("changeDocument failed: {any}", .{e});
-
-        if (notification.contentChanges.len == 0) {
+        if (params.contentChanges.len == 0) {
             return;
         }
 
-        const file = self.files.get(notification.textDocument.uri) orelse {
-            log.err("changeDocument failed: unknown file: {any}", .{notification.textDocument.uri});
-
-            try self.windowNotification(
-                .Error,
-                "Unrecognized languageId, expected are: wren",
-                .{},
-            );
-            return error.InvalidParams;
+        const file = self.files.get(params.textDocument.uri) orelse {
+            log.err("changeDocument failed: unknown file", .{});
+            return;
         };
 
-        for (notification.contentChanges) |change_| {
+        for (params.contentChanges) |change_| {
             const new_text = switch (change_) {
                 .literal_1 => |change| try self.gpa.dupeZ(u8, change.text),
                 .literal_0 => |change| blk: {
                     const old_text = file.src;
                     const range = change.range;
-                    const start_idx = offsets.maybePositionToIndex(old_text, range.start, self.offset_encoding) orelse {
-                        log.warn("changeDocument failed: invalid start position: {any}", .{range.start});
-                        return error.InternalError;
-                    };
-                    const end_idx = offsets.maybePositionToIndex(old_text, range.end, self.offset_encoding) orelse {
-                        log.warn("changeDocument failed: invalid end position: {any}", .{range.end});
-                        return error.InternalError;
-                    };
-                    var new_text = std.ArrayList(u8).init(self.gpa);
-                    errdefer new_text.deinit();
-                    try new_text.appendSlice(old_text[0..start_idx]);
-                    try new_text.appendSlice(change.text);
-                    try new_text.appendSlice(old_text[end_idx..]);
-                    break :blk try new_text.toOwnedSliceSentinel(0);
+                    const start_idx = offsets.positionToIndex(old_text, range.start, self.offset_encoding);
+                    const end_idx = offsets.positionToIndex(old_text, range.end, self.offset_encoding);
+                    var new_text_list: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer new_text_list.deinit(self.gpa);
+                    try new_text_list.appendSlice(self.gpa, old_text[0..start_idx]);
+                    try new_text_list.appendSlice(self.gpa, change.text);
+                    try new_text_list.appendSlice(self.gpa, old_text[end_idx..]);
+                    break :blk try new_text_list.toOwnedSliceSentinel(self.gpa, 0);
                 },
             };
             errdefer self.gpa.free(new_text);
 
-            // TODO: this is a hack while we wait for actual incremental reloads
             try self.loadFile(
                 arena,
                 new_text,
-                notification.textDocument.uri,
+                params.textDocument.uri,
                 file.language,
             );
         }
     }
 
-    pub fn saveDocument(
-        _: Handler,
-        arena: std.mem.Allocator,
-        notification: types.DidSaveTextDocumentParams,
-    ) !void {
-        _ = arena;
-        _ = notification;
-    }
+    pub fn @"textDocument/didSave"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.DidSaveTextDocumentParams,
+    ) !void {}
 
-    pub fn closeDocument(
+    pub fn @"textDocument/didClose"(
         self: *Handler,
         _: std.mem.Allocator,
-        notification: types.DidCloseTextDocumentParams,
-    ) error{}!void {
-        var kv = self.files.fetchRemove(notification.textDocument.uri) orelse return;
+        params: types.DidCloseTextDocumentParams,
+    ) !void {
+        var kv = self.files.fetchRemove(params.textDocument.uri) orelse return;
         self.gpa.free(kv.key);
         kv.value.deinit(self.gpa);
     }
 
-    pub fn completion(
-        self: Handler,
-        arena: std.mem.Allocator,
-        request: types.CompletionParams,
-    ) !ResultType("textDocument/completion") {
-        _ = self;
-        _ = arena;
-        _ = request;
+    pub fn @"textDocument/completion"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.CompletionParams,
+    ) !lsp.ResultType("textDocument/completion") {
         return .{
-            .CompletionList = types.CompletionList{
+            .CompletionList = .{
                 .isIncomplete = false,
                 .items = &.{},
             },
         };
     }
 
-    pub fn gotoDefinition(
-        self: Handler,
-        arena: std.mem.Allocator,
-        request: types.DefinitionParams,
-    ) !ResultType("textDocument/definition") {
-        _ = self;
-        _ = arena;
-        _ = request;
-        return null;
-    }
-
-    pub fn hover(
-        self: Handler,
-        arena: std.mem.Allocator,
-        request: types.HoverParams,
-        offset_encoding: offsets.Encoding,
-    ) !?types.Hover {
-        _ = self;
-        _ = arena; // autofix
-        _ = request;
-        _ = offset_encoding; // autofix
-
-        return types.Hover{
-            .contents = .{
-                .MarkupContent = .{
-                    .kind = .markdown,
-                    .value = "",
-                },
-            },
-        };
-    }
-
-    pub fn documentSymbol(
-        _: Handler,
+    pub fn @"textDocument/hover"(
+        _: *Handler,
         _: std.mem.Allocator,
-        _: types.DocumentSymbolParams,
-    ) !ResultType("textDocument/documentSymbol") {
+        _: types.HoverParams,
+    ) !?types.Hover {
         return null;
     }
 
-    pub fn references(
-        _: Handler,
-        arena: std.mem.Allocator,
-        request: types.ReferenceParams,
-    ) !?[]types.Location {
-        _ = arena;
-        _ = request;
+    pub fn @"textDocument/definition"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.DefinitionParams,
+    ) !lsp.ResultType("textDocument/definition") {
         return null;
     }
 
-    pub fn formatting(
-        self: Handler,
+    pub fn @"textDocument/references"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.ReferenceParams,
+    ) !lsp.ResultType("textDocument/references") {
+        return null;
+    }
+
+    pub fn @"textDocument/semanticTokens/full"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.SemanticTokensParams,
+    ) !?types.SemanticTokens {
+        return null;
+    }
+
+    pub fn @"textDocument/inlayHint"(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: types.InlayHintParams,
+    ) !lsp.ResultType("textDocument/inlayHint") {
+        return null;
+    }
+
+    pub fn onResponse(
+        _: *Handler,
+        _: std.mem.Allocator,
+        _: lsp.JsonRPCMessage.Response,
+    ) !void {}
+
+    fn loadFile(
+        self: *Handler,
         arena: std.mem.Allocator,
-        request: types.DocumentFormattingParams,
-    ) !?[]const types.TextEdit {
-        log.debug("format request!!", .{});
+        new_text: [:0]const u8,
+        uri: []const u8,
+        language: Language,
+    ) !void {
+        var res: types.PublishDiagnosticsParams = .{
+            .uri = uri,
+            .diagnostics = &.{},
+        };
 
-        const doc = self.files.getPtr(request.textDocument.uri) orelse return null;
-        //if (doc.html.errors.len != 0) {
-        //return null;
-        //}
-
-        log.debug("format!!", .{});
-
-        const buf = std.ArrayList(u8).init(arena);
-        //try doc.html.render(doc.src, buf.writer());
-
-        const edits = try lsp.diff.edits(
-            arena,
-            doc.src,
-            buf.items,
-            self.offset_encoding,
+        const doc = try Document.init(
+            self.gpa,
+            new_text,
+            language,
         );
 
-        if (builtin.mode == .Debug) {
-            if (std.mem.eql(u8, buf.items, doc.src)) {
-                std.debug.assert(edits.items.len == 0);
+        log.debug("document init", .{});
+
+        const gop = try self.files.getOrPut(self.gpa, uri);
+        errdefer _ = self.files.remove(uri);
+
+        if (gop.found_existing) {
+            gop.value_ptr.deinit(self.gpa);
+        } else {
+            gop.key_ptr.* = try self.gpa.dupe(u8, uri);
+        }
+
+        gop.value_ptr.* = doc;
+
+        log.debug("document errors: {d}", .{doc.parser.errors.items.len});
+
+        if (doc.parser.errors.items.len != 0) {
+            const diags = try arena.alloc(types.Diagnostic, doc.parser.errors.items.len);
+
+            for (doc.parser.errors.items, diags) |err, *d| {
+                log.debug("Error is {s}", .{err.message});
+                const range = getRange(err.token);
+                d.* = .{
+                    .range = range,
+                    .severity = .Error,
+                    .message = err.message,
+                };
             }
+
+            res.diagnostics = diags;
         }
 
-        return edits.items;
-    }
-
-    pub fn semanticTokensFull(
-        _: Handler,
-        arena: std.mem.Allocator,
-        request: types.SemanticTokensParams,
-    ) !?types.SemanticTokens {
-        _ = arena;
-        _ = request;
-        return null;
-    }
-
-    pub fn inlayHint(
-        _: Handler,
-        arena: std.mem.Allocator,
-        request: types.InlayHintParams,
-    ) !?[]types.InlayHint {
-        _ = arena;
-        _ = request;
-        return null;
-    }
-
-    /// Handle a response that we have received from the client.
-    /// Doesn't usually happen unless we explicitly send a request to the client.
-    pub fn response(self: Handler, _response: Message.Response) !void {
-        _ = self;
-        const id: []const u8 = switch (_response.id) {
-            .string => |id| id,
-            .number => |id| {
-                log.warn("received response from client with id '{d}' that has no handler!", .{id});
-                return;
-            },
-        };
-
-        if (_response.data == .@"error") {
-            const err = _response.data.@"error";
-            log.err("Error response for '{s}': {}, {s}", .{ id, err.code, err.message });
-            return;
-        }
-
-        log.warn("received response from client with id '{s}' that has no handler!", .{id});
+        try self.transport.writeNotification(
+            self.gpa,
+            "textDocument/publishDiagnostics",
+            types.PublishDiagnosticsParams,
+            res,
+            .{ .emit_null_optional_fields = false },
+        );
     }
 };
 
-pub fn getRange(token: Token) lsp.types.Range {
+pub fn getRange(token: Token) types.Range {
     const line = @as(u32, @intCast(token.source.lineAt(token.start)));
     return .{
-        .start = .{ .line = line - 1, .character = @as(u32, @intCast(token.start)) },
-        .end = .{ .line = line - 1, .character = @as(u32, @intCast(token.start)) },
+        .start = .{ .line = if (line > 0) line - 1 else 0, .character = @as(u32, @intCast(token.start)) },
+        .end = .{ .line = if (line > 0) line - 1 else 0, .character = @as(u32, @intCast(token.start)) },
     };
 }

@@ -1,12 +1,12 @@
 .{
     .name = .wren_lsp,
     .fingerprint = 0x40cfa79e7e3a1555,
-    .minimum_zig_version = "0.14.0-dev.3451+d8d2aa9af",
+    .minimum_zig_version = "0.15.2",
     .version = "0.1.0",
     .dependencies = .{
         .lsp_kit = .{
-            .url = "git+https://github.com/kristoff-it/zig-lsp-kit#87ff3d537a0c852442e180137d9557711963802c",
-            .hash = "lsp_kit-0.1.0-hAAxO9S9AADv_5D0iplASFtNCFXAPk54M0u-3jj2MRFk",
+            .url = "git+https://github.com/zigtools/lsp-kit?ref=0.15.x#421ae644f53bd788e3699b5fc22b3e07b161e2b6",
+            .hash = "lsp_kit-0.1.0-bi_PL5wxCgB1_jRIZtcodh-x-_nteVzuOrul2ken-ZLE",
         },
     },
     .paths = .{

@@ -1,54 +1,25 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const lsp_namespace = @import("lsp.zig");
 const lsp = @import("lsp");
+const lsp_handler = @import("lsp.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    defer {
-        _ = gpa.deinit();
-    }
-
-    var server: lsp_namespace.WrenLsp = undefined;
-
-    var transport = lsp.Transport.init(
-        std.io.getStdIn().reader(),
-        std.io.getStdOut().writer(),
+    var read_buffer: [65536]u8 = undefined;
+    var stdio = lsp.Transport.Stdio.init(
+        &read_buffer,
+        std.fs.File.stdin(),
+        std.fs.File.stdout(),
     );
 
-    var handler: lsp_namespace.Handler = .{
-        .gpa = allocator,
-        .server = &server,
-    };
-    server = try lsp_namespace.WrenLsp.init(allocator, &transport, &handler);
+    var handler = lsp_handler.Handler.init(allocator, &stdio.transport);
 
-    try server.loop();
-
-    //const allocator = switch (builtin.cpu.arch) {
-    //.wasm32 => std.heap.wasm_allocator,
-    //else => general_purpose_allocator.allocator(),
-    //};
-
-    //var transport = Transport.init(
-    //std.io.getStdIn().reader(),
-    //std.io.getStdOut().writer(),
-    //);
-    //transport.message_tracing = false;
-
-    //const server = try Server.init(allocator, &transport);
-    //defer server.destroy();
-
-    //try server.loop();
-
-    //if (server.status == .exiting_failure) {
-    //if (builtin.mode == .Debug) {
-    //// make sure that GeneralPurposeAllocator.deinit gets run to detect leaks
-    //return;
-    //} else {
-    //std.process.exit(1);
-    //}
-    //}
+    try lsp.basic_server.run(
+        allocator,
+        &stdio.transport,
+        &handler,
+        lsp_handler.log.err,
+    );
 }

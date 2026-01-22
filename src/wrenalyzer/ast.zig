@@ -357,7 +357,7 @@ pub const NumExpr = struct {
 
     pub fn toString(self: NumExpr, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Num({})", .{self.value.type});
+        try fbs.writer().print("Num({any})", .{self.value.type});
         return fbs.getWritten();
     }
 };
@@ -552,7 +552,7 @@ pub const BreakStmt = struct {
 
     pub fn toString(self: BreakStmt, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Break({s})", .{self.keyword.?});
+        try fbs.writer().print("Break({any})", .{self.keyword.?});
         return fbs.getWritten();
     }
 };

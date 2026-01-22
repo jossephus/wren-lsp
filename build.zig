@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) !void {
     run_step.dependOn(&run_cmd.step);
 }
 
-fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Mode) *std.Build.Module {
+fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     _ = .{ b, target, optimize };
     const exe_mod = b.addModule("wrenalyzer", .{
         .root_source_file = b.path("src/wrenalyzer/root.zig"),
@@ -43,7 +43,7 @@ fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     return exe_mod;
 }
 
-fn buildLsp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Mode) *std.Build.Step.Compile {
+fn buildLsp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const lsp = b.dependency("lsp_kit", .{});
     const wrenalyzer = build_wren_analyzer(b, target, optimize);
 
