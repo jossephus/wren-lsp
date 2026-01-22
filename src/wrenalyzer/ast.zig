@@ -68,6 +68,13 @@ pub const Node = union(NodeTag) {
         };
         std.debug.print("{s}\n", .{result});
     }
+
+    pub fn identifierToken(self: Node) Token {
+        const result = switch (self) {
+            .VarStmt => |v| v.name.?.identifierToken(),
+        };
+        return result;
+    }
 };
 
 pub const Module = struct {

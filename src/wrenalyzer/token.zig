@@ -105,4 +105,8 @@ pub const Token = struct {
 
         try writer.print("{s}:{d}:{d}", .{ self.type, self.start, self.length });
     }
+
+    pub fn name(self: Token) []const u8 {
+        return self.source.code[self.start .. self.start + self.length];
+    }
 };
