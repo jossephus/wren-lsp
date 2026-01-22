@@ -56,7 +56,7 @@ fn resolveNode(self: *Resolver, node: *const ast.Node) void {
         .MapExpr => |expr| self.visitMapExpr(expr),
         .SubscriptExpr => |expr| self.visitSubscriptExpr(expr),
         .SuperExpr => |expr| self.visitSuperExpr(expr),
-        .Module => |mod| self.resolve(mod),
+        .Module => {},
         .NumExpr, .BoolExpr, .NullExpr, .StringExpr, .ThisExpr, .FieldExpr, .StaticFieldExpr => {},
     }
 }

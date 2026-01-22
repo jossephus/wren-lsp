@@ -6,7 +6,9 @@ const builtin = @import("builtin");
 const lsp = @import("lsp");
 const offsets = lsp.offsets;
 const types = lsp.types;
-const Token = @import("wrenalyzer").Token;
+const wrenalyzer = @import("wrenalyzer");
+const Token = wrenalyzer.Token;
+const Scope = wrenalyzer.Scope;
 
 pub const Language = enum {
     wren,
@@ -85,13 +87,13 @@ pub const Handler = struct {
                 .completionProvider = .{
                     .triggerCharacters = &[_][]const u8{"."},
                 },
-                .hoverProvider = .{ .bool = false },
-                .definitionProvider = .{ .bool = false },
+                .hoverProvider = .{ .bool = true },
+                .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = false },
                 .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
-                        .full = .{ .bool = false },
+                        .full = .{ .bool = true },
                         .legend = .{
                             .tokenTypes = std.meta.fieldNames(types.SemanticTokenTypes),
                             .tokenModifiers = std.meta.fieldNames(types.SemanticTokenModifiers),
@@ -197,32 +199,82 @@ pub const Handler = struct {
     }
 
     pub fn @"textDocument/completion"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.CompletionParams,
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.CompletionParams,
     ) !lsp.ResultType("textDocument/completion") {
+        const doc = self.files.get(params.textDocument.uri) orelse {
+            return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
+        };
+
+        const symbols = doc.getSymbolsInScope();
+        var items = try arena.alloc(types.CompletionItem, symbols.len);
+
+        for (symbols, 0..) |sym, i| {
+            items[i] = .{
+                .label = sym.name,
+                .kind = symbolKindToCompletionKind(sym.kind),
+            };
+        }
+
         return .{
             .CompletionList = .{
                 .isIncomplete = false,
-                .items = &.{},
+                .items = items,
             },
         };
     }
 
     pub fn @"textDocument/hover"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.HoverParams,
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.HoverParams,
     ) !?types.Hover {
-        return null;
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        const sym = doc.findSymbolAtPosition(
+            params.position.line,
+            params.position.character,
+        ) orelse return null;
+
+        const kind_str = switch (sym.kind) {
+            .variable => "variable",
+            .parameter => "parameter",
+            .class => "class",
+            .method => "method",
+            .field => "field",
+            .static_field => "static field",
+            .import_var => "import",
+        };
+
+        const content = try std.fmt.allocPrint(arena, "**{s}** `{s}`", .{ kind_str, sym.name });
+
+        return .{
+            .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
+            .range = tokenToRange(sym.token),
+        };
     }
 
     pub fn @"textDocument/definition"(
-        _: *Handler,
+        self: *Handler,
         _: std.mem.Allocator,
-        _: types.DefinitionParams,
+        params: types.DefinitionParams,
     ) !lsp.ResultType("textDocument/definition") {
-        return null;
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        const sym = doc.findSymbolAtPosition(
+            params.position.line,
+            params.position.character,
+        ) orelse return null;
+
+        return .{
+            .Definition = .{
+                .Location = .{
+                    .uri = params.textDocument.uri,
+                    .range = tokenToRange(sym.token),
+                },
+            },
+        };
     }
 
     pub fn @"textDocument/references"(
@@ -234,11 +286,43 @@ pub const Handler = struct {
     }
 
     pub fn @"textDocument/semanticTokens/full"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.SemanticTokensParams,
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensParams,
     ) !?types.SemanticTokens {
-        return null;
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var data: std.ArrayListUnmanaged(u32) = .empty;
+        var prev_line: u32 = 0;
+        var prev_col: u32 = 0;
+
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+
+            const token_type = tokenTagToSemanticType(token.type) orelse continue;
+
+            const line_num = doc.source_file.lineAt(token.start);
+            const line: u32 = if (line_num > 0) @intCast(line_num - 1) else 0;
+            const col_num = doc.source_file.columnAt(token.start);
+            const col: u32 = if (col_num > 0) @intCast(col_num - 1) else 0;
+
+            const delta_line = line - prev_line;
+            const delta_col = if (delta_line == 0) col - prev_col else col;
+
+            try data.append(arena, delta_line);
+            try data.append(arena, delta_col);
+            try data.append(arena, @intCast(token.length));
+            try data.append(arena, @intFromEnum(token_type));
+            try data.append(arena, 0);
+
+            prev_line = line;
+            prev_col = col;
+        }
+
+        return .{ .data = data.items };
     }
 
     pub fn @"textDocument/inlayHint"(
@@ -335,5 +419,47 @@ pub fn tokenToRange(token: Token) types.Range {
             .line = line,
             .character = if (col_end > 0) @intCast(col_end - 1) else 0,
         },
+    };
+}
+
+fn symbolKindToCompletionKind(kind: Scope.Symbol.Kind) types.CompletionItemKind {
+    return switch (kind) {
+        .variable => .Variable,
+        .parameter => .Variable,
+        .class => .Class,
+        .method => .Method,
+        .field => .Field,
+        .static_field => .Field,
+        .import_var => .Module,
+    };
+}
+
+fn tokenTagToSemanticType(tag: Token.Tag) ?types.SemanticTokenTypes {
+    return switch (tag) {
+        .breakKeyword,
+        .classKeyword,
+        .constructKeyword,
+        .elseKeyword,
+        .falseKeyword,
+        .forKeyword,
+        .foreignKeyword,
+        .ifKeyword,
+        .importKeyword,
+        .inKeyword,
+        .isKeyword,
+        .nullKeyword,
+        .returnKeyword,
+        .staticKeyword,
+        .superKeyword,
+        .thisKeyword,
+        .trueKeyword,
+        .varKeyword,
+        .whileKeyword,
+        => .keyword,
+        .name => .variable,
+        .number => .number,
+        .string, .interpolation => .string,
+        .field, .staticField => .property,
+        else => null,
     };
 }

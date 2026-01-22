@@ -79,13 +79,14 @@ pub fn definition(self: *Parser) ast.Node {
 
     if (self.match(Tag.varKeyword) != null) {
         const name = self.consume(Tag.name, "Expect variable name.");
-        var initializer: ?ast.Node = null;
+        const initializer = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+        initializer.* = null;
 
         if (self.match(Tag.equal) != null) {
-            initializer = self.expression();
+            initializer.* = self.expression();
         }
 
-        return .{ .VarStmt = ast.VarStmt.init(name, &initializer) };
+        return .{ .VarStmt = ast.VarStmt.init(name, initializer) };
     }
 
     return self.statement();
@@ -102,11 +103,12 @@ pub fn statement(self: *Parser) ast.Node {
 
     if (self.match(Tag.returnKeyword) != null) {
         const keyword = self.previous;
-        var value: ?ast.Node = null;
+        const value = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+        value.* = null;
         if (self.peek() != Tag.line) {
-            value = self.expression();
+            value.* = self.expression();
         }
-        return .{ .ReturnStmt = ast.ReturnStmt.init(keyword, &value) };
+        return .{ .ReturnStmt = ast.ReturnStmt.init(keyword, value) };
     }
 
     if (self.match(Tag.leftBrace)) |_| return self.blockStatement();
@@ -148,9 +150,10 @@ pub fn whileStatement(self: *Parser) ast.Node {
     condition.* = self.expression();
 
     _ = self.consume(Tag.rightParen, "Expect ')' after while condition.");
-    var body = self.statement();
+    const body = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    body.* = self.statement();
 
-    return .{ .WhileStmt = ast.WhileStmt.init(condition, &body) };
+    return .{ .WhileStmt = ast.WhileStmt.init(condition, body) };
 }
 
 pub fn blockStatement(self: *Parser) ast.Node {
@@ -174,21 +177,26 @@ pub fn forStatement(self: *Parser) ast.Node {
     _ = self.consume(Tag.inKeyword, "Expect 'in' after loop variable.");
 
     self.ignoreLine();
-    var iterator = self.expression();
+    const iterator = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    iterator.* = self.expression();
 
     _ = self.consume(Tag.rightParen, "Expect ')' after loop expression.");
-    var body = self.statement();
+    const body = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    body.* = self.statement();
 
-    return .{ .ForStmt = ast.ForStmt.init(variable, &iterator, &body) };
+    return .{ .ForStmt = ast.ForStmt.init(variable, iterator, body) };
 }
 
 pub fn assignment(self: *Parser) ast.Node {
-    var expr = self.conditional();
+    const expr = self.conditional();
     if (self.match(Tag.equal) == null) return expr;
 
     const equal = self.previous;
-    var value = self.assignment();
-    return ast.Node{ .AssignmentExpr = ast.AssignmentExpr.init(&expr, equal.?, &value) };
+    const target = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    target.* = expr;
+    const value = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    value.* = self.assignment();
+    return ast.Node{ .AssignmentExpr = ast.AssignmentExpr.init(target, equal.?, value) };
 }
 
 pub fn conditional(self: *Parser) ast.Node {
@@ -330,10 +338,14 @@ fn call(self: *Parser) ast.Node {
             const leftBracket = self.previous;
             const arguments = self.argumentsList();
             const rightBracket = self.consume(Tag.rightBracket, "Expect ']' after subscript arguments");
-            expr = .{ .SubscriptExpr = ast.SubscriptExpr.init(&expr, leftBracket, arguments, rightBracket) };
+            const receiver = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+            receiver.* = expr;
+            expr = .{ .SubscriptExpr = ast.SubscriptExpr.init(receiver, leftBracket, arguments, rightBracket) };
         } else if (self.match(Tag.dot) != null) {
             const name = self.consume(Tag.name, "Expect method name after '.'.");
-            expr = self.methodCall(&expr, name.?);
+            const receiver = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+            receiver.* = expr;
+            expr = self.methodCall(receiver, name.?);
         } else {
             break;
         }
@@ -344,8 +356,9 @@ fn call(self: *Parser) ast.Node {
 
 fn methodCall(self: *Parser, receiver: ?*ast.Node, name: Token) ast.Node {
     const arguments = self.finishCall();
-    var blockArgument = arguments.blockArgument;
-    return .{ .CallExpr = ast.CallExpr.init(receiver, name, arguments.arguments, &blockArgument) };
+    const blockArgument = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    blockArgument.* = arguments.blockArgument;
+    return .{ .CallExpr = ast.CallExpr.init(receiver, name, arguments.arguments, blockArgument) };
 }
 
 fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
@@ -419,13 +432,14 @@ fn method(self: *Parser) ast.Node {
         }
     }
 
-    var body: ?ast.Node = null;
+    const body = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    body.* = null;
     if (foreignKeyword == null) {
         _ = self.consume(Tag.leftBrace, "Expect '{' before method body.");
-        body = self.finishBody(parameters);
+        body.* = self.finishBody(parameters);
     }
 
-    return .{ .Method = ast.Method.init(foreignKeyword, staticKeyword, constructKeyword, name, parameters, &body) };
+    return .{ .Method = ast.Method.init(foreignKeyword, staticKeyword, constructKeyword, name, parameters, body) };
 }
 
 fn finishCall(self: *Parser) struct {
@@ -465,16 +479,19 @@ fn finishCall(self: *Parser) struct {
 }
 
 fn finishBody(self: *Parser, parameters: []Token) Node {
-    if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, &[_]ast.Node{}) };
+    const empty_stmts = self.allocator.alloc(ast.Node, 0) catch @panic("Error allocating memory");
+    if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, empty_stmts) };
 
     if (!self.matchLine()) {
-        var expr = self.expression();
+        const expr = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        expr.* = self.expression();
         self.ignoreLine();
         _ = self.consume(Tag.rightBrace, "Expect '}' at end of block.");
-        return .{ .Body = ast.Body.init(parameters, &expr, null) };
+        return .{ .Body = ast.Body.init(parameters, expr, null) };
     }
 
-    if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, &[_]ast.Node{}) };
+    const empty_stmts2 = self.allocator.alloc(ast.Node, 0) catch @panic("Error allocating memory");
+    if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, empty_stmts2) };
 
     var statements: std.ArrayListUnmanaged(ast.Node) = .empty;
 
@@ -521,8 +538,10 @@ fn superCall(self: *Parser) ast.Node {
         name = self.consume(Tag.name, "Expect method name after 'super.'.");
     }
 
-    var arguments = self.finishCall();
-    return .{ .SuperExpr = ast.SuperExpr.init(name, arguments.arguments, &arguments.blockArgument) };
+    const arguments = self.finishCall();
+    const blockArgument = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    blockArgument.* = arguments.blockArgument;
+    return .{ .SuperExpr = ast.SuperExpr.init(name, arguments.arguments, blockArgument) };
 }
 
 fn primary(self: *Parser) ast.Node {
