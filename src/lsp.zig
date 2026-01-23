@@ -207,6 +207,16 @@ pub const Handler = struct {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
         };
 
+        if (params.context) |ctx| {
+            if (ctx.triggerKind == .TriggerCharacter and ctx.triggerCharacter != null) {
+                if (std.mem.eql(u8, ctx.triggerCharacter.?, ".")) {
+                    if (try self.getMemberCompletions(arena, doc, params.position)) |items| {
+                        return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
+                    }
+                }
+            }
+        }
+
         const symbols = doc.getSymbolsInScope();
         var items = try arena.alloc(types.CompletionItem, symbols.len);
 
@@ -223,6 +233,66 @@ pub const Handler = struct {
                 .items = items,
             },
         };
+    }
+
+    fn getMemberCompletions(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        position: types.Position,
+    ) !?[]types.CompletionItem {
+        _ = self;
+
+        if (position.character == 0) return null;
+
+        const offset = doc.positionToOffset(position.line, position.character - 1) orelse return null;
+
+        var end = offset;
+        while (end > 0 and isIdentChar(doc.src[end - 1])) {
+            end -= 1;
+        }
+
+        if (end >= offset) return null;
+
+        const receiver_name = doc.src[end..offset];
+
+        if (Scope.BUILTIN_METHODS.get(receiver_name)) |methods| {
+            var items = try arena.alloc(types.CompletionItem, methods.len);
+            for (methods, 0..) |method, i| {
+                items[i] = .{
+                    .label = method.name,
+                    .kind = .Method,
+                    .detail = method.signature,
+                };
+            }
+            return items;
+        }
+
+        for (doc.symbols.items) |sym| {
+            if (std.mem.eql(u8, sym.name, receiver_name)) {
+                if (sym.inferred_type) |inferred_type| {
+                    const type_name = @tagName(inferred_type);
+                    if (Scope.INSTANCE_METHODS.get(type_name)) |methods| {
+                        var items = try arena.alloc(types.CompletionItem, methods.len);
+                        for (methods, 0..) |method, i| {
+                            items[i] = .{
+                                .label = method.name,
+                                .kind = .Method,
+                                .detail = method.signature,
+                            };
+                        }
+                        return items;
+                    }
+                }
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    fn isIdentChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '_';
     }
 
     pub fn @"textDocument/hover"(

@@ -669,8 +669,7 @@ fn consumeLine(self: *Parser) void {
 fn consume(self: *Parser, tag: Tag, message: ?[]const u8) ?Token {
     const tok = self.consumeToken();
     if (tok.?.type != tag) {
-        std.debug.print("Expected: {any}, found: {any}", .{ tag, tok.?.type });
-        self.err(message orelse "SOON!!");
+        self.err(message orelse "Unexpected token.");
     }
 
     return tok;

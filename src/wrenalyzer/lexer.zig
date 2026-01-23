@@ -51,14 +51,8 @@ fn readField(self: *Lexer) !Token {
         tag = Tag.staticField;
     }
 
-    const val = std.meta.intToEnum(Chars, self.source.code[self.current]) catch null;
-
-    if (val != null) {
-        var c: Chars = @enumFromInt(self.source.code[self.current]);
-        while (c.is_alpha_numeric()) {
-            self.advance();
-            c = @enumFromInt(self.source.code[self.current]);
-        }
+    while (!self.isAtEnd() and std.ascii.isAlphanumeric(self.source.code[self.current])) {
+        self.advance();
     }
 
     return self.makeToken(tag);
@@ -193,10 +187,8 @@ pub fn isAtEnd(self: *Lexer) bool {
 }
 
 fn readNumber(self: *Lexer) !Token {
-    var c = self.source.code[self.current];
-    while (std.ascii.isDigit(c)) {
+    while (!self.isAtEnd() and std.ascii.isDigit(self.source.code[self.current])) {
         self.advance();
-        c = self.source.code[self.current];
     }
 
     return self.makeToken(Tag.number);
@@ -204,10 +196,8 @@ fn readNumber(self: *Lexer) !Token {
 
 fn readHexNumber(self: *Lexer) !Token {
     self.advance();
-    var c: Chars = @enumFromInt(self.source.code[self.current]);
-    while (c.is_hex_digit()) {
+    while (!self.isAtEnd() and std.ascii.isHex(self.source.code[self.current])) {
         self.advance();
-        c = @enumFromInt(self.source.code[self.current]);
     }
 
     return self.makeToken(Tag.number);
@@ -239,13 +229,11 @@ fn makeToken(self: *Lexer, tag: Tag) Token {
 }
 
 fn readName(self: *Lexer) !Token {
-    var c = self.source.code[self.current];
-    while (std.ascii.isAlphabetic(c)) {
+    while (!self.isAtEnd() and std.ascii.isAlphabetic(self.source.code[self.current])) {
         self.advance();
-        c = self.source.code[self.current];
     }
 
-    const text = self.source.code[self.start .. self.start + (self.current - self.start)];
+    const text = self.source.code[self.start..self.current];
     var @"type" = Tag.name;
 
     if (KeyWords.has(text)) {
@@ -315,4 +303,75 @@ pub fn initPunctuators(allocator: std.mem.Allocator) !std.AutoHashMap(Chars, []c
     });
 
     return map;
+}
+
+test "lexer handles hex numbers without panic" {
+    const allocator = std.testing.allocator;
+    const src = "static carriageReturn { 0x0d }";
+    const source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, source_file);
+    defer lexer.punctuators.deinit();
+
+    var count: usize = 0;
+    while (count < 100) : (count += 1) {
+        const tok = try lexer.readToken();
+        if (tok.type == .eof) break;
+    }
+    try std.testing.expect(count < 100);
+}
+
+test "lexer handles fields without panic" {
+    const allocator = std.testing.allocator;
+    const src = "_field _staticField";
+    const source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, source_file);
+    defer lexer.punctuators.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.field, tok1.type);
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.staticField, tok2.type);
+}
+
+test "lexer handles source ending with identifier" {
+    const allocator = std.testing.allocator;
+    const src = "name";
+    const source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, source_file);
+    defer lexer.punctuators.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.name, tok1.type);
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.eof, tok2.type);
+}
+
+test "lexer handles source ending with number" {
+    const allocator = std.testing.allocator;
+    const src = "123";
+    const source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, source_file);
+    defer lexer.punctuators.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.number, tok1.type);
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.eof, tok2.type);
+}
+
+test "lexer handles source ending with hex number" {
+    const allocator = std.testing.allocator;
+    const src = "0xFF";
+    const source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, source_file);
+    defer lexer.punctuators.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.number, tok1.type);
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.eof, tok2.type);
 }

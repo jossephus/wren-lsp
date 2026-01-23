@@ -102,13 +102,29 @@ fn visitBody(self: *Resolver, body: ast.Body) void {
 }
 
 fn visitVarStmt(self: *Resolver, stmt: ast.VarStmt) void {
+    var inferred_type: ?Scope.Symbol.InferredType = null;
+
     if (stmt.initializer.*) |*initializer| {
         self.resolveNode(initializer);
+        inferred_type = self.inferType(initializer);
     }
 
     if (stmt.name) |name| {
-        self.scope.declare(name, .variable);
+        self.scope.declareWithType(name, .variable, inferred_type);
     }
+}
+
+fn inferType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType {
+    _ = self;
+    return switch (node.*) {
+        .NumExpr => .num,
+        .StringExpr => .string,
+        .BoolExpr => .bool_type,
+        .NullExpr => .null_type,
+        .ListExpr => .list,
+        .MapExpr => .map,
+        else => null,
+    };
 }
 
 fn visitImportStmt(self: *Resolver, stmt: ast.ImportStmt) void {
