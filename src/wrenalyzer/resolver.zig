@@ -356,6 +356,7 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
     var arities: [8]usize = undefined;
     var arity_len: usize = 0;
     var matches_arity = false;
+    var matched_name = false;
 
     for (class_stmt.methods) |method_node| {
         const method = switch (method_node) {
@@ -365,6 +366,7 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
 
         if (method.name == null) continue;
         if (!std.mem.eql(u8, method.name.?.name(), call_name)) continue;
+        matched_name = true;
 
         if (class_info.is_static) {
             if (method.staticKeyword == null and method.constructKeyword == null) continue;
@@ -387,7 +389,20 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
         }
     }
 
-    if (arity_len == 0 or matches_arity) return;
+    if (matches_arity) return;
+
+    if (arity_len == 0) {
+        if (class_info.is_static and std.mem.eql(u8, call_name, "new")) return;
+        const kind_label = if (class_info.is_static) "static" else "instance";
+        var buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "Unknown {s} method {s}.{s}",
+            .{ kind_label, class_info.name, call_name },
+        ) catch "Unknown method";
+        self.reporter.reportError(expr.name, msg);
+        return;
+    }
 
     const kind_label = if (class_info.is_static) "static" else "instance";
 
