@@ -282,11 +282,15 @@ fn resolveInternal(self: *Scope, name_token: Token, report_errors: bool) ?Symbol
         }
     }
 
+    // If we're inside a class and didn't find the symbol in local scopes
     if (reached_class) {
+        // Lowercase identifiers could be implicit method calls on `this`
+        // so we don't report them as errors
         if (name.len > 0 and std.ascii.isLower(name[0])) {
             return null;
         }
 
+        // Uppercase identifiers should be in module scope (classes)
         if (self.scopes.items[0]) |module_scope| {
             if (module_scope.get(name)) |sym| {
                 return sym;

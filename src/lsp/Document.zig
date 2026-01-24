@@ -32,12 +32,14 @@ language: lsp_namespace.Language,
 source_file: SourceFile,
 reporter: Reporter,
 symbols: std.ArrayListUnmanaged(SymbolInfo),
+refs: std.ArrayListUnmanaged(ResolvedRef) = .empty,
 
 const log = std.log.scoped(.wren_lsp);
 
 pub fn deinit(doc: *Document, gpa: std.mem.Allocator) void {
     doc.reporter.deinit();
     doc.symbols.deinit(gpa);
+    doc.refs.deinit(gpa);
 }
 
 pub fn init(
@@ -58,6 +60,8 @@ pub fn init(
 
     var symbols: std.ArrayListUnmanaged(SymbolInfo) = .empty;
 
+    var refs: std.ArrayListUnmanaged(ResolvedRef) = .empty;
+
     var resolver = Resolver.init(gpa, &reporter) catch {
         log.err("Failed to init resolver", .{});
         return .{
@@ -68,9 +72,11 @@ pub fn init(
             .module = module,
             .reporter = reporter,
             .symbols = symbols,
+            .refs = refs,
         };
     };
     defer resolver.deinit();
+    resolver.refs_out = &refs;
     resolver.resolve(&module);
 
     for (resolver.scope.scopes.items) |maybe_scope| {
@@ -97,6 +103,7 @@ pub fn init(
         .module = module,
         .reporter = reporter,
         .symbols = symbols,
+        .refs = refs,
     };
 }
 
@@ -142,4 +149,43 @@ pub fn findSymbolAtPosition(self: *const Document, line: u32, character: u32) ?S
 
 pub fn getSymbolsInScope(self: *const Document) []const SymbolInfo {
     return self.symbols.items;
+}
+
+pub fn tokenAtPosition(self: *const Document, line: u32, col: u32) ?Token {
+    const offset = self.positionToOffset(line, col) orelse return null;
+
+    for (self.symbols.items) |sym| {
+        const start = sym.token.start;
+        const end = start + sym.token.length;
+        if (offset >= start and offset < end) {
+            return sym.token;
+        }
+    }
+
+    return null;
+}
+
+pub fn resolvedAtPosition(self: *const Document, line: u32, col: u32) ?ResolvedRef {
+    const offset = self.positionToOffset(line, col) orelse return null;
+
+    // Check if cursor is on a use of a variable
+    for (self.refs.items) |ref| {
+        const start = ref.use_token.start;
+        const end = start + ref.use_token.length;
+        if (offset >= start and offset < end) {
+            return ref;
+        }
+    }
+
+    // Check if cursor is on a declaration (decl_token)
+    // Return any ref that points to this declaration
+    for (self.refs.items) |ref| {
+        const start = ref.decl_token.start;
+        const end = start + ref.decl_token.length;
+        if (offset >= start and offset < end) {
+            return ref;
+        }
+    }
+
+    return null;
 }

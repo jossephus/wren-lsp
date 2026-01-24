@@ -108,6 +108,9 @@ pub const Handler = struct {
                     },
                 },
                 .inlayHintProvider = .{ .bool = false },
+                .workspaceSymbolProvider = .{ .bool = true },
+                .foldingRangeProvider = .{ .bool = true },
+                .selectionRangeProvider = .{ .bool = true },
             },
         };
     }
@@ -947,6 +950,57 @@ pub const Handler = struct {
     ) !?types.WorkspaceEdit {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
+        // Use resolved reference index if available
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            var edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
+
+            // Track which declaration starts we've already added to avoid duplicates
+            var added_decl = false;
+
+            // Find all references to this declaration
+            for (doc.refs.items) |ref| {
+                if (ref.decl_token.start == resolved.decl_token.start) {
+                    try edits.append(arena, .{
+                        .range = tokenToRange(ref.use_token),
+                        .newText = params.newName,
+                    });
+                }
+            }
+
+            // Also include the declaration itself (check doc.symbols first for module-level)
+            for (doc.symbols.items) |sym| {
+                if (sym.token.start == resolved.decl_token.start) {
+                    try edits.append(arena, .{
+                        .range = tokenToRange(sym.token),
+                        .newText = params.newName,
+                    });
+                    added_decl = true;
+                    break;
+                }
+            }
+
+            // If declaration not found in symbols (e.g., local variable inside method),
+            // add it directly from the resolved ref's decl_token
+            if (!added_decl) {
+                try edits.append(arena, .{
+                    .range = tokenToRange(resolved.decl_token),
+                    .newText = params.newName,
+                });
+            }
+
+            if (edits.items.len == 0) return null;
+
+            const uri = params.textDocument.uri;
+            const uri_edits = try arena.alloc(types.TextEdit, edits.items.len);
+            @memcpy(uri_edits, edits.items);
+
+            var changes = lsp.parser.Map(types.DocumentUri, []const types.TextEdit){};
+            try changes.map.put(arena, uri, uri_edits);
+
+            return .{ .changes = changes };
+        }
+
+        // Fallback to old implementation
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
@@ -1760,6 +1814,19 @@ pub const Handler = struct {
         _: std.mem.Allocator,
         _: lsp.JsonRPCMessage.Response,
     ) !void {}
+
+    fn countParens(signature: []const u8) usize {
+        const open_index = std.mem.indexOfScalar(u8, signature, '(') orelse return 0;
+        const close_index = std.mem.indexOfScalarPos(u8, signature, open_index, ')') orelse return 0;
+        if (close_index <= open_index + 1) return 0;
+
+        var count: usize = 1;
+        var i = open_index + 1;
+        while (i < close_index) : (i += 1) {
+            if (signature[i] == ',') count += 1;
+        }
+        return count;
+    }
 
     fn loadFile(
         self: *Handler,
