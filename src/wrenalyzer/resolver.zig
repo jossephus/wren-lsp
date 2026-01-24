@@ -15,6 +15,7 @@ allocator: std.mem.Allocator,
 scope: Scope,
 reporter: *Reporter,
 class_depth: usize,
+module: ?*ast.Module,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -22,6 +23,7 @@ pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
         .scope = try Scope.init(allocator, reporter),
         .reporter = reporter,
         .class_depth = 0,
+        .module = null,
     };
 }
 
@@ -30,6 +32,7 @@ pub fn deinit(self: *Resolver) void {
 }
 
 pub fn resolve(self: *Resolver, module: *ast.Module) void {
+    self.module = module;
     for (module.statements) |*stmt| {
         self.resolveNode(stmt);
     }
@@ -108,17 +111,20 @@ fn visitBody(self: *Resolver, body: ast.Body) void {
 fn visitVarStmt(self: *Resolver, stmt: ast.VarStmt) void {
     var inferred_type: ?Scope.Symbol.InferredType = null;
     var fn_arity: ?usize = null;
+    var class_name: ?[]const u8 = null;
 
     if (stmt.initializer.*) |*initializer| {
         self.resolveNode(initializer);
         inferred_type = self.inferType(initializer);
         if (inferred_type == .fn_type) {
             fn_arity = self.inferFnArity(initializer);
+        } else if (inferred_type == .class_type) {
+            class_name = self.inferClassName(initializer);
         }
     }
 
     if (stmt.name) |name| {
-        self.scope.declareWithType(name, .variable, inferred_type, fn_arity);
+        self.scope.declareWithType(name, .variable, inferred_type, fn_arity, class_name);
     }
 }
 
@@ -126,6 +132,7 @@ fn inferType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType 
     return switch (node.*) {
         .CallExpr => |expr| blk: {
             if (self.isFnNewCall(expr)) break :blk .fn_type;
+            if (self.classNewName(expr) != null) break :blk .class_type;
             break :blk null;
         },
         .NumExpr => .num,
@@ -134,6 +141,13 @@ fn inferType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType 
         .NullExpr => .null_type,
         .ListExpr => .list,
         .MapExpr => .map,
+        else => null,
+    };
+}
+
+fn inferClassName(self: *Resolver, node: *const ast.Node) ?[]const u8 {
+    return switch (node.*) {
+        .CallExpr => |expr| self.classNewName(expr),
         else => null,
     };
 }
@@ -164,6 +178,19 @@ fn isFnNewCall(self: *Resolver, expr: ast.CallExpr) bool {
             return std.mem.eql(u8, recv_call.name.name(), "Fn");
         },
         else => return false,
+    }
+}
+
+fn classNewName(self: *Resolver, expr: ast.CallExpr) ?[]const u8 {
+    _ = self;
+    if (!std.mem.eql(u8, expr.name.name(), "new")) return null;
+    const receiver = expr.receiver orelse return null;
+    switch (receiver.*) {
+        .CallExpr => |recv_call| {
+            if (recv_call.receiver != null) return null;
+            return recv_call.name.name();
+        },
+        else => return null,
     }
 }
 
@@ -224,6 +251,7 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         self.resolveNode(recv);
         self.checkFnCallArity(recv, expr);
         self.checkBuiltinCallArity(recv, expr);
+        self.checkUserMethodArity(recv, expr);
     } else {
         if (self.scope.resolveOptional(expr.name) == null and self.class_depth == 0) {
             _ = self.scope.resolve(expr.name);
@@ -311,6 +339,116 @@ fn checkBuiltinCallArity(self: *Resolver, receiver: *const ast.Node, expr: ast.C
         .{ list_slice, type_name, call_name, arg_count },
     ) catch "Incorrect argument count";
     self.reporter.reportError(expr.name, msg);
+}
+
+fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.CallExpr) void {
+    const class_info = self.resolveClassReceiver(receiver) orelse return;
+    const module = self.module orelse return;
+
+    const class_stmt = self.findClassStmt(module, class_info.name) orelse return;
+
+    const call_name = expr.name.name();
+    var arg_count: usize = expr.arguments.len;
+    if (expr.blockArgument.* != null) {
+        arg_count += 1;
+    }
+
+    var arities: [8]usize = undefined;
+    var arity_len: usize = 0;
+    var matches_arity = false;
+
+    for (class_stmt.methods) |method_node| {
+        const method = switch (method_node) {
+            .Method => |value| value,
+            else => continue,
+        };
+
+        if (method.name == null) continue;
+        if (!std.mem.eql(u8, method.name.?.name(), call_name)) continue;
+
+        if (class_info.is_static) {
+            if (method.staticKeyword == null and method.constructKeyword == null) continue;
+        } else {
+            if (method.staticKeyword != null) continue;
+            if (method.constructKeyword != null) continue;
+        }
+
+        const arity = method.parameters.len;
+        if (!containsArity(arities[0..arity_len], arity)) {
+            if (arity_len < arities.len) {
+                arities[arity_len] = arity;
+                arity_len += 1;
+            }
+        }
+
+        if (arity == arg_count) {
+            matches_arity = true;
+            break;
+        }
+    }
+
+    if (arity_len == 0 or matches_arity) return;
+
+    const kind_label = if (class_info.is_static) "static" else "instance";
+    const arity_list = self.formatArityList(arities[0..arity_len]);
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Expected {s} arguments for {s} {s}.{s}, found {d}",
+        .{ arity_list, kind_label, class_info.name, call_name, arg_count },
+    ) catch "Incorrect argument count";
+    self.reporter.reportError(expr.name, msg);
+}
+
+fn resolveClassReceiver(self: *Resolver, receiver: *const ast.Node) ?struct { name: []const u8, is_static: bool } {
+    const recv_call = switch (receiver.*) {
+        .CallExpr => |call| call,
+        else => return null,
+    };
+
+    if (recv_call.receiver != null) return null;
+
+    const sym = self.scope.resolveOptional(recv_call.name) orelse return null;
+    if (sym.kind == .class) {
+        return .{ .name = sym.name, .is_static = true };
+    }
+
+    if (sym.kind == .variable) {
+        if (sym.class_name) |class_name| {
+            return .{ .name = class_name, .is_static = false };
+        }
+    }
+
+    return null;
+}
+
+fn findClassStmt(self: *Resolver, module: *ast.Module, class_name: []const u8) ?ast.ClassStmt {
+    _ = self;
+    for (module.statements) |stmt| {
+        switch (stmt) {
+            .ClassStmt => |class_stmt| {
+                if (class_stmt.name) |name_token| {
+                    if (std.mem.eql(u8, name_token.name(), class_name)) {
+                        return class_stmt;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn formatArityList(self: *Resolver, arities: []const usize) []const u8 {
+    _ = self;
+    var list_buf: [64]u8 = undefined;
+    var list_stream = std.io.fixedBufferStream(&list_buf);
+    const list_writer = list_stream.writer();
+    for (arities, 0..) |arity, i| {
+        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
+        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
+    }
+    return list_stream.getWritten();
 }
 
 fn receiverInferredType(self: *Resolver, receiver: *const ast.Node) ?Scope.Symbol.InferredType {

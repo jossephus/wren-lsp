@@ -20,6 +20,7 @@ pub const SymbolInfo = struct {
     kind: Scope.Symbol.Kind,
     inferred_type: ?Scope.Symbol.InferredType,
     fn_arity: ?usize,
+    class_name: ?[]const u8,
 };
 
 module: ast.Module,
@@ -80,6 +81,7 @@ pub fn init(
                     .kind = entry.value_ptr.kind,
                     .inferred_type = entry.value_ptr.inferred_type,
                     .fn_arity = entry.value_ptr.fn_arity,
+                    .class_name = entry.value_ptr.class_name,
                 }) catch {};
             }
         }

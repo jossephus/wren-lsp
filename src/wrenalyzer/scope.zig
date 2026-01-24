@@ -14,6 +14,7 @@ pub const Symbol = struct {
     kind: Kind,
     inferred_type: ?InferredType = null,
     fn_arity: ?usize = null,
+    class_name: ?[]const u8 = null,
 
     pub const Kind = enum {
         variable,
@@ -34,6 +35,7 @@ pub const Symbol = struct {
         map,
         range,
         fn_type,
+        class_type,
         fiber,
         unknown,
     };
@@ -207,7 +209,7 @@ pub fn deinit(self: *Scope) void {
 }
 
 pub fn declare(self: *Scope, name_token: Token, kind: Symbol.Kind) void {
-    self.declareWithType(name_token, kind, null, null);
+    self.declareWithType(name_token, kind, null, null, null);
 }
 
 pub fn declareWithType(
@@ -216,6 +218,7 @@ pub fn declareWithType(
     kind: Symbol.Kind,
     inferred_type: ?Symbol.InferredType,
     fn_arity: ?usize,
+    class_name: ?[]const u8,
 ) void {
     const name = name_token.name();
 
@@ -238,6 +241,7 @@ pub fn declareWithType(
         .kind = kind,
         .inferred_type = inferred_type,
         .fn_arity = fn_arity,
+        .class_name = class_name,
     }) catch {
         self.reporter.reportError(name_token, "Failed to declare variable");
     };

@@ -293,6 +293,15 @@ pub const Handler = struct {
                 log.debug("member completion: symbol match '{s}' kind={s}", .{ sym.name, @tagName(sym.kind) });
                 if (sym.inferred_type) |inferred_type| {
                     const type_name = @tagName(inferred_type);
+                    if (inferred_type == .class_type) {
+                        if (sym.class_name) |class_name| {
+                            if (try self.getClassInstanceCompletions(arena, doc, class_name, uri)) |items| {
+                                log.debug("member completion: class instance methods={d}", .{items.len});
+                                return items;
+                            }
+                        }
+                        break;
+                    }
                     if (Scope.INSTANCE_METHODS.get(type_name)) |methods| {
                         var items = try arena.alloc(types.CompletionItem, methods.len);
                         for (methods, 0..) |method, i| {
@@ -346,6 +355,29 @@ pub const Handler = struct {
         return self.getClassStaticCompletionsInModule(arena, import_doc.module, receiver_name);
     }
 
+    fn getClassInstanceCompletions(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        class_name: []const u8,
+        uri: []const u8,
+    ) !?[]types.CompletionItem {
+        if (try self.getClassInstanceCompletionsInModule(arena, doc.module, class_name)) |items| {
+            return items;
+        }
+
+        const import_path = self.findImportPath(doc, class_name) orelse return null;
+        const import_uri = try self.resolveImportUri(arena, uri, import_path);
+        if (self.files.get(import_uri) == null) {
+            self.loadImportedFile(import_uri) catch |err| {
+                log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
+            };
+        }
+
+        const import_doc = self.files.get(import_uri) orelse return null;
+        return self.getClassInstanceCompletionsInModule(arena, import_doc.module, class_name);
+    }
+
     fn getClassStaticCompletionsInModule(
         self: *Handler,
         arena: std.mem.Allocator,
@@ -375,7 +407,69 @@ pub const Handler = struct {
         for (class_stmt.methods) |method_node| {
             switch (method_node) {
                 .Method => |method| {
-                    if (method.staticKeyword == null) continue;
+                    const name_token = method.name orelse continue;
+                    if (method.staticKeyword == null and method.constructKeyword == null) continue;
+                    _ = name_token;
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+
+        if (count == 0) return null;
+
+        var items = try arena.alloc(types.CompletionItem, count);
+        var idx: usize = 0;
+        for (class_stmt.methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (method.staticKeyword == null and method.constructKeyword == null) continue;
+                    const name_token = method.name orelse continue;
+                    items[idx] = .{
+                        .label = name_token.name(),
+                        .kind = .Method,
+                        .detail = if (method.constructKeyword != null) "construct" else "static",
+                    };
+                    idx += 1;
+                },
+                else => {},
+            }
+        }
+
+        return items[0..idx];
+    }
+
+    fn getClassInstanceCompletionsInModule(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        module: wrenalyzer.Ast.Module,
+        class_name: []const u8,
+    ) !?[]types.CompletionItem {
+        _ = self;
+
+        var class_node: ?wrenalyzer.Ast.ClassStmt = null;
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), class_name)) {
+                            class_node = class_stmt;
+                            break;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const class_stmt = class_node orelse return null;
+
+        var count: usize = 0;
+        for (class_stmt.methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (method.staticKeyword != null) continue;
+                    if (method.constructKeyword != null) continue;
                     if (method.name == null) continue;
                     count += 1;
                 },
@@ -390,12 +484,12 @@ pub const Handler = struct {
         for (class_stmt.methods) |method_node| {
             switch (method_node) {
                 .Method => |method| {
-                    if (method.staticKeyword == null) continue;
+                    if (method.staticKeyword != null) continue;
+                    if (method.constructKeyword != null) continue;
                     const name_token = method.name orelse continue;
                     items[idx] = .{
                         .label = name_token.name(),
                         .kind = .Method,
-                        .detail = "static",
                     };
                     idx += 1;
                 },
@@ -723,6 +817,8 @@ pub const Handler = struct {
 
             for (reporter_diags, diags) |rdiag, *d| {
                 log.debug("Error is {s}", .{rdiag.message});
+                const message_src = if (rdiag.message.len == 0) "Unknown error" else rdiag.message;
+                const message = try arena.dupe(u8, message_src);
                 d.* = .{
                     .range = tokenToRange(rdiag.token),
                     .severity = switch (rdiag.severity) {
@@ -731,7 +827,7 @@ pub const Handler = struct {
                         .info => .Information,
                         .hint => .Hint,
                     },
-                    .message = rdiag.message,
+                    .message = message,
                 };
             }
 
