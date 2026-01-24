@@ -100,6 +100,9 @@ pub const BUILTIN_METHODS = std.StaticStringMap([]const BuiltinMethod).initCompt
     .{ "Range", &[_]BuiltinMethod{
         .{ .name = "new", .signature = "new(from, to)" },
     } },
+    .{ "Fn", &[_]BuiltinMethod{
+        .{ .name = "new", .signature = "new(block)" },
+    } },
 });
 
 pub const INSTANCE_METHODS = std.StaticStringMap([]const BuiltinMethod).initComptime(.{
@@ -148,6 +151,10 @@ pub const INSTANCE_METHODS = std.StaticStringMap([]const BuiltinMethod).initComp
         .{ .name = "trim", .signature = "trim()" },
         .{ .name = "trimEnd", .signature = "trimEnd()" },
         .{ .name = "trimStart", .signature = "trimStart()" },
+    } },
+    .{ "fn_type", &[_]BuiltinMethod{
+        .{ .name = "call", .signature = "call()" },
+        .{ .name = "call", .signature = "call(arg)" },
     } },
     .{ "list", &[_]BuiltinMethod{
         .{ .name = "add", .signature = "add(item)" },

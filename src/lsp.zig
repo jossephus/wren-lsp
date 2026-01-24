@@ -634,12 +634,58 @@ pub const Handler = struct {
         arena: std.mem.Allocator,
         params: types.HoverParams,
     ) !?types.Hover {
-        const doc = self.files.get(params.textDocument.uri) orelse return null;
+        log.debug("hover: uri={s} line={d} col={d}", .{ params.textDocument.uri, params.position.line, params.position.character });
 
+        const doc = self.files.get(params.textDocument.uri) orelse {
+            log.debug("hover: document not found", .{});
+            return null;
+        };
+
+        var range: ?types.Range = null;
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
-        ) orelse return null;
+        ) orelse blk: {
+            const offset = doc.positionToOffset(params.position.line, params.position.character) orelse {
+                log.debug("hover: no symbol at position", .{});
+                return null;
+            };
+
+            if (offset >= doc.src.len) {
+                log.debug("hover: offset out of range", .{});
+                return null;
+            }
+
+            var start = offset;
+            while (start > 0 and isIdentChar(doc.src[start - 1])) {
+                start -= 1;
+            }
+
+            var end = offset;
+            while (end < doc.src.len and isIdentChar(doc.src[end])) {
+                end += 1;
+            }
+
+            if (start == end) {
+                log.debug("hover: no ident at position", .{});
+                return null;
+            }
+
+            const ident = doc.src[start..end];
+            log.debug("hover: fallback ident '{s}'", .{ident});
+
+            for (doc.getSymbolsInScope()) |fallback_sym| {
+                if (std.mem.eql(u8, fallback_sym.name, ident)) {
+                    range = rangeForOffsets(doc.source_file, start, end);
+                    break :blk fallback_sym;
+                }
+            }
+
+            log.debug("hover: no symbol match for ident", .{});
+            return null;
+        };
+
+        log.debug("hover: symbol '{s}' kind={s}", .{ sym.name, @tagName(sym.kind) });
 
         const kind_str = switch (sym.kind) {
             .variable => "variable",
@@ -655,7 +701,7 @@ pub const Handler = struct {
 
         return .{
             .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
-            .range = tokenToRange(sym.token),
+            .range = range orelse tokenToRange(sym.token),
         };
     }
 
@@ -855,6 +901,25 @@ pub fn tokenToRange(token: Token) types.Range {
 
     const col_start = token.source.columnAt(token.start);
     const col_end = token.source.columnAt(token.start + token.length);
+
+    return .{
+        .start = .{
+            .line = line,
+            .character = if (col_start > 0) @intCast(col_start - 1) else 0,
+        },
+        .end = .{
+            .line = line,
+            .character = if (col_end > 0) @intCast(col_end - 1) else 0,
+        },
+    };
+}
+
+fn rangeForOffsets(source_file: wrenalyzer.SourceFile, start: usize, end: usize) types.Range {
+    const line_num = source_file.lineAt(start);
+    const line: u32 = if (line_num > 0) @intCast(line_num - 1) else 0;
+
+    const col_start = source_file.columnAt(start);
+    const col_end = source_file.columnAt(end);
 
     return .{
         .start = .{
