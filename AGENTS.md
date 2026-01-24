@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Git Workflow
+
+**Never commit or push unless explicitly told to do so.** Always verify with the user before making commits.
+
 ## Zig Development
 
 Always use `zigdoc` to discover APIs for the Zig standard library and any third-party dependencies.
