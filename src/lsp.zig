@@ -90,6 +90,7 @@ pub const Handler = struct {
                 .hoverProvider = .{ .bool = true },
                 .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
+                .renameProvider = .{ .bool = true },
                 .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
@@ -766,6 +767,74 @@ pub const Handler = struct {
         }
 
         return locations.items;
+    }
+
+    pub fn @"textDocument/rename"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.RenameParams,
+    ) !?types.WorkspaceEdit {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        const sym = doc.findSymbolAtPosition(
+            params.position.line,
+            params.position.character,
+        ) orelse blk: {
+            const offset = doc.positionToOffset(params.position.line, params.position.character) orelse return null;
+            if (offset >= doc.src.len) return null;
+
+            var start = offset;
+            while (start > 0 and isIdentChar(doc.src[start - 1])) {
+                start -= 1;
+            }
+
+            var end = offset;
+            while (end < doc.src.len and isIdentChar(doc.src[end])) {
+                end += 1;
+            }
+
+            if (start == end) return null;
+
+            const ident = doc.src[start..end];
+            for (doc.getSymbolsInScope()) |fallback_sym| {
+                if (std.mem.eql(u8, fallback_sym.name, ident)) {
+                    break :blk fallback_sym;
+                }
+            }
+
+            return null;
+        };
+
+        var edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
+
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+
+            switch (token.type) {
+                .name, .field, .staticField => {},
+                else => continue,
+            }
+
+            if (!std.mem.eql(u8, token.name(), sym.name)) continue;
+
+            try edits.append(arena, .{
+                .range = tokenToRange(token),
+                .newText = params.newName,
+            });
+        }
+
+        if (edits.items.len == 0) return null;
+
+        const uri = params.textDocument.uri;
+        const uri_edits = try arena.alloc(types.TextEdit, edits.items.len);
+        @memcpy(uri_edits, edits.items);
+
+        var changes = lsp.parser.Map(types.DocumentUri, []const types.TextEdit){};
+        try changes.map.put(arena, uri, uri_edits);
+
+        return .{ .changes = changes };
     }
 
     pub fn @"textDocument/semanticTokens/full"(
