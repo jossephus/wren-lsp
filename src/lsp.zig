@@ -208,6 +208,10 @@ pub const Handler = struct {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
         };
 
+        if (try getImportPathCompletions(arena, doc, params.position, params.textDocument.uri)) |items| {
+            return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
+        }
+
         const should_check_members = blk: {
             if (params.context) |ctx| {
                 if (ctx.triggerKind == .TriggerCharacter and ctx.triggerCharacter != null) {
@@ -328,6 +332,87 @@ pub const Handler = struct {
         return null;
     }
 
+    fn getImportPathCompletions(
+        arena: std.mem.Allocator,
+        doc: Document,
+        position: types.Position,
+        uri: []const u8,
+    ) !?[]types.CompletionItem {
+        const offset = doc.positionToOffset(position.line, position.character) orelse return null;
+        if (offset > doc.src.len) return null;
+
+        const lines = doc.source_file.lines;
+        const line_index: usize = @intCast(position.line);
+        if (line_index >= lines.len) return null;
+
+        const line_start = lines[line_index];
+        const line_end = if (line_index + 1 < lines.len) lines[line_index + 1] else doc.src.len;
+        if (offset < line_start or offset > line_end) return null;
+
+        const line_slice = doc.src[line_start..line_end];
+        const local_offset = offset - line_start;
+
+        const import_index = std.mem.indexOf(u8, line_slice, "import") orelse return null;
+        var i = import_index + "import".len;
+        while (i < line_slice.len and std.ascii.isWhitespace(line_slice[i])) : (i += 1) {}
+        if (i >= line_slice.len) return null;
+
+        const quote = line_slice[i];
+        if (quote != '"' and quote != '\'') return null;
+        const quote_start = i + 1;
+        const close_index = std.mem.indexOfScalarPos(u8, line_slice, quote_start, quote);
+
+        if (local_offset < quote_start) return null;
+        if (close_index) |close_pos| {
+            if (local_offset > close_pos) return null;
+        }
+
+        const prefix = line_slice[quote_start..local_offset];
+        return try listImportCompletions(arena, uri, prefix);
+    }
+
+    fn listImportCompletions(
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        prefix: []const u8,
+    ) !?[]types.CompletionItem {
+        const base_path = uriToPath(uri);
+        const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+
+        var dir = try std.fs.cwd().openDir(base_dir, .{ .iterate = true });
+        defer dir.close();
+
+        var walker = try dir.walk(arena);
+        defer walker.deinit();
+
+        const trimmed_prefix = if (std.mem.startsWith(u8, prefix, "./")) prefix[2..] else prefix;
+        const needs_dot = std.mem.startsWith(u8, prefix, "./");
+
+        var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
+
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".wren")) continue;
+
+            const path_no_ext = entry.path[0 .. entry.path.len - 5];
+            if (trimmed_prefix.len > 0 and !std.mem.startsWith(u8, path_no_ext, trimmed_prefix)) continue;
+
+            const insert_text = if (needs_dot)
+                try std.fmt.allocPrint(arena, "./{s}", .{path_no_ext})
+            else
+                try arena.dupe(u8, path_no_ext);
+
+            try items.append(arena, .{
+                .label = insert_text,
+                .kind = .File,
+                .insertText = insert_text,
+            });
+        }
+
+        if (items.items.len == 0) return null;
+        return items.items;
+    }
+
     fn getClassStaticCompletions(
         self: *Handler,
         arena: std.mem.Allocator,
@@ -340,20 +425,26 @@ pub const Handler = struct {
             return items;
         }
 
-        const import_path = self.findImportPath(doc, receiver_name) orelse return null;
-        log.debug("member completion: import path for '{s}' is '{s}'", .{ receiver_name, import_path });
-        const import_uri = try self.resolveImportUri(arena, uri, import_path);
-        log.debug("member completion: resolved import uri '{s}'", .{import_uri});
-        if (self.files.get(import_uri) == null) {
-            self.loadImportedFile(import_uri) catch |err| {
-                log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
-            };
+        if (self.findImportPath(doc, receiver_name)) |import_path| {
+            log.debug("member completion: import path for '{s}' is '{s}'", .{ receiver_name, import_path });
+            const import_uri = try self.resolveImportUri(arena, uri, import_path);
+            log.debug("member completion: resolved import uri '{s}'", .{import_uri});
+            if (self.files.get(import_uri) == null) {
+                self.loadImportedFile(import_uri) catch |err| {
+                    log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
+                };
+            }
+
+            const import_doc = self.files.get(import_uri) orelse return null;
+            log.debug("member completion: imported doc found for '{s}'", .{import_uri});
+            return self.getClassStaticCompletionsInModule(arena, import_doc.module, receiver_name);
         }
 
-        const import_doc = self.files.get(import_uri) orelse return null;
-        log.debug("member completion: imported doc found for '{s}'", .{import_uri});
+        if (try self.findImportModuleByClassName(arena, doc, receiver_name, uri)) |module| {
+            return self.getClassStaticCompletionsInModule(arena, module, receiver_name);
+        }
 
-        return self.getClassStaticCompletionsInModule(arena, import_doc.module, receiver_name);
+        return null;
     }
 
     fn getClassInstanceCompletions(
@@ -522,6 +613,54 @@ pub const Handler = struct {
         }
 
         return null;
+    }
+
+    fn findImportModuleByClassName(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        receiver_name: []const u8,
+        uri: []const u8,
+    ) !?wrenalyzer.Ast.Module {
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ImportStmt => |import_stmt| {
+                    const path_token = import_stmt.path orelse continue;
+                    const raw_path = stripQuotes(path_token.name());
+                    if (!isImportFilePath(raw_path)) continue;
+
+                    const import_uri = try self.resolveImportUri(arena, uri, raw_path);
+                    if (self.files.get(import_uri) == null) {
+                        self.loadImportedFile(import_uri) catch |err| {
+                            log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
+                        };
+                    }
+
+                    const import_doc = self.files.get(import_uri) orelse continue;
+                    if (self.classExistsInModule(import_doc.module, receiver_name)) {
+                        return import_doc.module;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
+    fn classExistsInModule(self: *Handler, module: wrenalyzer.Ast.Module, class_name: []const u8) bool {
+        _ = self;
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), class_name)) return true;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn resolveImportUri(

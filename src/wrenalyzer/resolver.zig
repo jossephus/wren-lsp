@@ -390,7 +390,16 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
     if (arity_len == 0 or matches_arity) return;
 
     const kind_label = if (class_info.is_static) "static" else "instance";
-    const arity_list = self.formatArityList(arities[0..arity_len]);
+
+    var list_buf: [64]u8 = undefined;
+    var list_stream = std.io.fixedBufferStream(&list_buf);
+    const list_writer = list_stream.writer();
+    for (arities[0..arity_len], 0..) |arity, i| {
+        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
+        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
+    }
+    const arity_list = list_stream.getWritten();
+
     var buf: [192]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &buf,
@@ -437,18 +446,6 @@ fn findClassStmt(self: *Resolver, module: *ast.Module, class_name: []const u8) ?
         }
     }
     return null;
-}
-
-fn formatArityList(self: *Resolver, arities: []const usize) []const u8 {
-    _ = self;
-    var list_buf: [64]u8 = undefined;
-    var list_stream = std.io.fixedBufferStream(&list_buf);
-    const list_writer = list_stream.writer();
-    for (arities, 0..) |arity, i| {
-        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
-        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
-    }
-    return list_stream.getWritten();
 }
 
 fn receiverInferredType(self: *Resolver, receiver: *const ast.Node) ?Scope.Symbol.InferredType {
