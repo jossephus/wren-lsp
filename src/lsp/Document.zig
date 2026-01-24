@@ -23,6 +23,8 @@ pub const SymbolInfo = struct {
     class_name: ?[]const u8,
 };
 
+pub const ResolvedRef = Resolver.ResolvedRef;
+
 module: ast.Module,
 bytes: []const u8,
 src: []const u8,
