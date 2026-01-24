@@ -1,6 +1,6 @@
 # LSP for Wren
 
-WIP LSP implementation for Wren.
+LSP implementation for Wren.
 
 ## Features
 
@@ -11,6 +11,10 @@ WIP LSP implementation for Wren.
 - [x] References
 - [x] Rename
 - [x] Semantic tokens
+
+## Demo
+
+![Wren LSP Demo](assets/demo.gif)
 
 ## Roadmap
 
@@ -26,16 +30,7 @@ WIP LSP implementation for Wren.
 
 ## Releases
 
-Download the matching binary from GitHub Releases:
-
-- `wren-lsp-linux-x86_64`
-- `wren-lsp-linux-aarch64`
-- `wren-lsp-macos-x86_64`
-- `wren-lsp-macos-aarch64`
-- `wren-lsp-windows-x86_64.exe`
-- `wren-lsp-windows-aarch64.exe`
-
-Make the binary executable and put it on your `PATH`.
+Download a binary based on your paltform from releases.
 
 ## Editor Setup
 

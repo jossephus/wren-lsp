@@ -874,10 +874,32 @@ pub const Handler = struct {
     ) !lsp.ResultType("textDocument/references") {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
-        const sym = doc.findSymbolAtPosition(
-            params.position.line,
-            params.position.character,
-        ) orelse return null;
+        var sym_token: ?wrenalyzer.Token = null;
+        const sym_name = blk: {
+            if (doc.findSymbolAtPosition(
+                params.position.line,
+                params.position.character,
+            )) |sym| {
+                sym_token = sym.token;
+                break :blk sym.name;
+            }
+
+            const offset = doc.positionToOffset(params.position.line, params.position.character) orelse return null;
+            if (offset >= doc.src.len) return null;
+
+            var start = offset;
+            while (start > 0 and isIdentChar(doc.src[start - 1])) {
+                start -= 1;
+            }
+
+            var end = offset;
+            while (end < doc.src.len and isIdentChar(doc.src[end])) {
+                end += 1;
+            }
+
+            if (start == end) return null;
+            break :blk doc.src[start..end];
+        };
 
         const include_decl = params.context.includeDeclaration;
 
@@ -893,10 +915,14 @@ pub const Handler = struct {
                 else => continue,
             }
 
-            if (!std.mem.eql(u8, token.name(), sym.name)) continue;
+            if (!std.mem.eql(u8, token.name(), sym_name)) continue;
 
-            if (!include_decl and token.start == sym.token.start and token.length == sym.token.length) {
-                continue;
+            if (!include_decl) {
+                if (sym_token) |token_sym| {
+                    if (token.start == token_sym.start and token.length == token_sym.length) {
+                        continue;
+                    }
+                }
             }
 
             try locations.append(arena, .{
