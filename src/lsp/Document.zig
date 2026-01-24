@@ -54,33 +54,31 @@ pub fn init(
 
     var symbols: std.ArrayListUnmanaged(SymbolInfo) = .empty;
 
-    if (!reporter.hasErrors()) {
-        var resolver = Resolver.init(gpa, &reporter) catch {
-            log.err("Failed to init resolver", .{});
-            return .{
-                .src = src,
-                .language = language,
-                .bytes = bytes,
-                .source_file = source_file,
-                .module = module,
-                .reporter = reporter,
-                .symbols = symbols,
-            };
+    var resolver = Resolver.init(gpa, &reporter) catch {
+        log.err("Failed to init resolver", .{});
+        return .{
+            .src = src,
+            .language = language,
+            .bytes = bytes,
+            .source_file = source_file,
+            .module = module,
+            .reporter = reporter,
+            .symbols = symbols,
         };
-        defer resolver.deinit();
-        resolver.resolve(&module);
+    };
+    defer resolver.deinit();
+    resolver.resolve(&module);
 
-        for (resolver.scope.scopes.items) |maybe_scope| {
-            if (maybe_scope) |scope| {
-                var iter = scope.iterator();
-                while (iter.next()) |entry| {
-                    symbols.append(gpa, .{
-                        .name = entry.value_ptr.name,
-                        .token = entry.value_ptr.token,
-                        .kind = entry.value_ptr.kind,
-                        .inferred_type = entry.value_ptr.inferred_type,
-                    }) catch {};
-                }
+    for (resolver.scope.scopes.items) |maybe_scope| {
+        if (maybe_scope) |scope| {
+            var iter = scope.iterator();
+            while (iter.next()) |entry| {
+                symbols.append(gpa, .{
+                    .name = entry.value_ptr.name,
+                    .token = entry.value_ptr.token,
+                    .kind = entry.value_ptr.kind,
+                    .inferred_type = entry.value_ptr.inferred_type,
+                }) catch {};
             }
         }
     }

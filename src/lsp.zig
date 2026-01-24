@@ -89,7 +89,7 @@ pub const Handler = struct {
                 },
                 .hoverProvider = .{ .bool = true },
                 .definitionProvider = .{ .bool = true },
-                .referencesProvider = .{ .bool = false },
+                .referencesProvider = .{ .bool = true },
                 .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
@@ -219,10 +219,14 @@ pub const Handler = struct {
             break :blk doc.src[offset - 1] == '.';
         };
 
+        log.debug("completion: check_members={}", .{should_check_members});
+
         if (should_check_members) {
             if (try self.getMemberCompletions(arena, doc, params.position)) |items| {
+                log.debug("completion: member items={d}", .{items.len});
                 return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
             }
+            log.debug("completion: no member completions", .{});
         }
 
         const symbols = doc.getSymbolsInScope();
@@ -264,6 +268,9 @@ pub const Handler = struct {
 
         const receiver_name = doc.src[end..offset];
 
+        log.debug("member completion: receiver='{s}'", .{receiver_name});
+        log.debug("member completion: symbols in scope={d}", .{doc.getSymbolsInScope().len});
+
         if (Scope.BUILTIN_METHODS.get(receiver_name)) |methods| {
             var items = try arena.alloc(types.CompletionItem, methods.len);
             for (methods, 0..) |method, i| {
@@ -273,11 +280,18 @@ pub const Handler = struct {
                     .detail = method.signature,
                 };
             }
+            log.debug("member completion: builtin methods={d}", .{methods.len});
+            return items;
+        }
+
+        if (try getClassStaticCompletions(arena, doc, receiver_name)) |items| {
+            log.debug("member completion: class static methods={d}", .{items.len});
             return items;
         }
 
         for (doc.symbols.items) |sym| {
             if (std.mem.eql(u8, sym.name, receiver_name)) {
+                log.debug("member completion: symbol match '{s}' kind={s}", .{ sym.name, @tagName(sym.kind) });
                 if (sym.inferred_type) |inferred_type| {
                     const type_name = @tagName(inferred_type);
                     if (Scope.INSTANCE_METHODS.get(type_name)) |methods| {
@@ -289,14 +303,77 @@ pub const Handler = struct {
                                 .detail = method.signature,
                             };
                         }
+                        log.debug("member completion: inferred type={s} methods={d}", .{ type_name, methods.len });
                         return items;
                     }
+                    log.debug("member completion: no methods for inferred type={s}", .{type_name});
+                } else {
+                    log.debug("member completion: no inferred type for symbol '{s}'", .{sym.name});
                 }
                 break;
             }
         }
 
+        log.debug("member completion: no symbol match for '{s}'", .{receiver_name});
+
         return null;
+    }
+
+    fn getClassStaticCompletions(
+        arena: std.mem.Allocator,
+        doc: Document,
+        receiver_name: []const u8,
+    ) !?[]types.CompletionItem {
+        var class_node: ?wrenalyzer.Ast.ClassStmt = null;
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), receiver_name)) {
+                            class_node = class_stmt;
+                            break;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const class_stmt = class_node orelse return null;
+
+        var count: usize = 0;
+        for (class_stmt.methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (method.staticKeyword == null) continue;
+                    if (method.name == null) continue;
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+
+        if (count == 0) return null;
+
+        var items = try arena.alloc(types.CompletionItem, count);
+        var idx: usize = 0;
+        for (class_stmt.methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (method.staticKeyword == null) continue;
+                    const name_token = method.name orelse continue;
+                    items[idx] = .{
+                        .label = name_token.name(),
+                        .kind = .Method,
+                        .detail = "static",
+                    };
+                    idx += 1;
+                },
+                else => {},
+            }
+        }
+
+        return items[0..idx];
     }
 
     fn isIdentChar(c: u8) bool {
@@ -356,11 +433,44 @@ pub const Handler = struct {
     }
 
     pub fn @"textDocument/references"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.ReferenceParams,
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.ReferenceParams,
     ) !lsp.ResultType("textDocument/references") {
-        return null;
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        const sym = doc.findSymbolAtPosition(
+            params.position.line,
+            params.position.character,
+        ) orelse return null;
+
+        const include_decl = params.context.includeDeclaration;
+
+        var locations: std.ArrayListUnmanaged(types.Location) = .empty;
+
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+
+            switch (token.type) {
+                .name, .field, .staticField => {},
+                else => continue,
+            }
+
+            if (!std.mem.eql(u8, token.name(), sym.name)) continue;
+
+            if (!include_decl and token.start == sym.token.start and token.length == sym.token.length) {
+                continue;
+            }
+
+            try locations.append(arena, .{
+                .uri = params.textDocument.uri,
+                .range = tokenToRange(token),
+            });
+        }
+
+        return locations.items;
     }
 
     pub fn @"textDocument/semanticTokens/full"(
