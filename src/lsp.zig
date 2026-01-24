@@ -91,6 +91,12 @@ pub const Handler = struct {
                 .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
                 .renameProvider = .{ .bool = true },
+                .documentSymbolProvider = .{ .bool = true },
+                .documentHighlightProvider = .{ .bool = true },
+                .signatureHelpProvider = .{
+                    .triggerCharacters = &[_][]const u8{ "(", "," },
+                },
+                .codeActionProvider = .{ .bool = true },
                 .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
@@ -102,6 +108,9 @@ pub const Handler = struct {
                     },
                 },
                 .inlayHintProvider = .{ .bool = false },
+                .workspaceSymbolProvider = .{ .bool = true },
+                .foldingRangeProvider = .{ .bool = true },
+                .selectionRangeProvider = .{ .bool = true },
             },
         };
     }
@@ -861,6 +870,19 @@ pub const Handler = struct {
     ) !lsp.ResultType("textDocument/definition") {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
+        // Use resolved reference index if available
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            return .{
+                .Definition = .{
+                    .Location = .{
+                        .uri = params.textDocument.uri,
+                        .range = tokenToRange(resolved.decl_token),
+                    },
+                },
+            };
+        }
+
+        // Fallback: check if cursor is on a declaration itself
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
@@ -883,63 +905,50 @@ pub const Handler = struct {
     ) !lsp.ResultType("textDocument/references") {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
-        var sym_token: ?wrenalyzer.Token = null;
-        const sym_name = blk: {
-            if (doc.findSymbolAtPosition(
-                params.position.line,
-                params.position.character,
-            )) |sym| {
-                sym_token = sym.token;
-                break :blk sym.name;
-            }
-
-            const offset = doc.positionToOffset(params.position.line, params.position.character) orelse return null;
-            if (offset >= doc.src.len) return null;
-
-            var start = offset;
-            while (start > 0 and isIdentChar(doc.src[start - 1])) {
-                start -= 1;
-            }
-
-            var end = offset;
-            while (end < doc.src.len and isIdentChar(doc.src[end])) {
-                end += 1;
-            }
-
-            if (start == end) return null;
-            break :blk doc.src[start..end];
-        };
-
         const include_decl = params.context.includeDeclaration;
+
+        // Use resolved reference index
+        // First, find the declaration token for the symbol at cursor
+        var decl_token_start: ?usize = null;
+
+        // Check if cursor is on a use site
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            decl_token_start = resolved.decl_token.start;
+        } else {
+            // Check if cursor is on declaration itself
+            if (doc.findSymbolAtPosition(params.position.line, params.position.character)) |sym| {
+                decl_token_start = sym.token.start;
+            }
+        }
+
+        const target_start = decl_token_start orelse return null;
 
         var locations: std.ArrayListUnmanaged(types.Location) = .empty;
 
-        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
-        while (true) {
-            const token = try lexer.readToken();
-            if (token.type == .eof) break;
-
-            switch (token.type) {
-                .name, .field, .staticField => {},
-                else => continue,
+        // Find all uses that refer to this declaration
+        for (doc.refs.items) |ref| {
+            if (ref.decl_token.start == target_start) {
+                try locations.append(arena, .{
+                    .uri = params.textDocument.uri,
+                    .range = tokenToRange(ref.use_token),
+                });
             }
-
-            if (!std.mem.eql(u8, token.name(), sym_name)) continue;
-
-            if (!include_decl) {
-                if (sym_token) |token_sym| {
-                    if (token.start == token_sym.start and token.length == token_sym.length) {
-                        continue;
-                    }
-                }
-            }
-
-            try locations.append(arena, .{
-                .uri = params.textDocument.uri,
-                .range = tokenToRange(token),
-            });
         }
 
+        // Include declaration if requested
+        if (include_decl) {
+            for (doc.symbols.items) |sym| {
+                if (sym.token.start == target_start) {
+                    try locations.append(arena, .{
+                        .uri = params.textDocument.uri,
+                        .range = tokenToRange(sym.token),
+                    });
+                    break;
+                }
+            }
+        }
+
+        if (locations.items.len == 0) return null;
         return locations.items;
     }
 
@@ -950,6 +959,57 @@ pub const Handler = struct {
     ) !?types.WorkspaceEdit {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
+        // Use resolved reference index if available
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            var edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
+
+            // Track which declaration starts we've already added to avoid duplicates
+            var added_decl = false;
+
+            // Find all references to this declaration
+            for (doc.refs.items) |ref| {
+                if (ref.decl_token.start == resolved.decl_token.start) {
+                    try edits.append(arena, .{
+                        .range = tokenToRange(ref.use_token),
+                        .newText = params.newName,
+                    });
+                }
+            }
+
+            // Also include the declaration itself (check doc.symbols first for module-level)
+            for (doc.symbols.items) |sym| {
+                if (sym.token.start == resolved.decl_token.start) {
+                    try edits.append(arena, .{
+                        .range = tokenToRange(sym.token),
+                        .newText = params.newName,
+                    });
+                    added_decl = true;
+                    break;
+                }
+            }
+
+            // If declaration not found in symbols (e.g., local variable inside method),
+            // add it directly from the resolved ref's decl_token
+            if (!added_decl) {
+                try edits.append(arena, .{
+                    .range = tokenToRange(resolved.decl_token),
+                    .newText = params.newName,
+                });
+            }
+
+            if (edits.items.len == 0) return null;
+
+            const uri = params.textDocument.uri;
+            const uri_edits = try arena.alloc(types.TextEdit, edits.items.len);
+            @memcpy(uri_edits, edits.items);
+
+            var changes = lsp.parser.Map(types.DocumentUri, []const types.TextEdit){};
+            try changes.map.put(arena, uri, uri_edits);
+
+            return .{ .changes = changes };
+        }
+
+        // Fallback to old implementation
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
@@ -1011,6 +1071,483 @@ pub const Handler = struct {
         return .{ .changes = changes };
     }
 
+    pub fn @"textDocument/documentHighlight"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.DocumentHighlightParams,
+    ) !?[]const types.DocumentHighlight {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var decl_token_start: ?usize = null;
+
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            decl_token_start = resolved.decl_token.start;
+        } else {
+            if (doc.findSymbolAtPosition(params.position.line, params.position.character)) |sym| {
+                decl_token_start = sym.token.start;
+            }
+        }
+
+        const target_start = decl_token_start orelse return null;
+
+        var highlights: std.ArrayListUnmanaged(types.DocumentHighlight) = .empty;
+        var added_decl = false;
+
+        for (doc.refs.items) |ref| {
+            if (ref.decl_token.start == target_start) {
+                try highlights.append(arena, .{
+                    .range = tokenToRange(ref.use_token),
+                    .kind = if (ref.is_write) .Write else .Read,
+                });
+            }
+        }
+
+        // Check module-level symbols for the declaration
+        for (doc.symbols.items) |sym| {
+            if (sym.token.start == target_start) {
+                try highlights.append(arena, .{
+                    .range = tokenToRange(sym.token),
+                    .kind = .Write,
+                });
+                added_decl = true;
+                break;
+            }
+        }
+
+        // If declaration not in symbols (local variable), get it from any ref
+        if (!added_decl) {
+            for (doc.refs.items) |ref| {
+                if (ref.decl_token.start == target_start) {
+                    try highlights.append(arena, .{
+                        .range = tokenToRange(ref.decl_token),
+                        .kind = .Write,
+                    });
+                    break;
+                }
+            }
+        }
+
+        if (highlights.items.len == 0) return null;
+        return highlights.items;
+    }
+
+    pub fn @"textDocument/codeAction"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.CodeActionParams,
+    ) !lsp.ResultType("textDocument/codeAction") {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        const code_action_slice = std.meta.Child(lsp.ResultType("textDocument/codeAction"));
+        const CodeActionItem = std.meta.Child(code_action_slice);
+        var actions: std.ArrayListUnmanaged(CodeActionItem) = .empty;
+
+        // Find diagnostics in the requested range
+        for (doc.getDiagnostics()) |diag| {
+            const diag_range = tokenToRange(diag.token);
+
+            // Check if diagnostic overlaps with requested range
+            if (diag_range.start.line > params.range.end.line or
+                diag_range.end.line < params.range.start.line)
+            {
+                continue;
+            }
+
+            const message = diag.message;
+            const token_name = diag.token.name();
+
+            // Create LSP diagnostic for association
+            var diag_arr = try arena.alloc(types.Diagnostic, 1);
+            diag_arr[0] = .{
+                .range = diag_range,
+                .severity = switch (diag.severity) {
+                    .@"error" => .Error,
+                    .warning => .Warning,
+                    .info => .Information,
+                    .hint => .Hint,
+                },
+                .message = try arena.dupe(u8, message),
+            };
+
+            // Undefined variable - suggest creating a variable declaration
+            if (std.mem.containsAtLeast(u8, message, 1, "not defined")) {
+                // Create edit to add variable declaration at start of current scope
+                var changes = lsp.parser.Map(types.DocumentUri, []const types.TextEdit){};
+
+                // Find a good insertion point (start of file for now)
+                const insert_text = try std.fmt.allocPrint(arena, "var {s} = null\n", .{token_name});
+                var edits = try arena.alloc(types.TextEdit, 1);
+                edits[0] = .{
+                    .range = .{
+                        .start = .{ .line = 0, .character = 0 },
+                        .end = .{ .line = 0, .character = 0 },
+                    },
+                    .newText = insert_text,
+                };
+                try changes.map.put(arena, params.textDocument.uri, edits);
+
+                try actions.append(arena, .{ .CodeAction = .{
+                    .title = try std.fmt.allocPrint(arena, "Create variable '{s}'", .{token_name}),
+                    .kind = .quickfix,
+                    .diagnostics = diag_arr,
+                    .edit = .{ .changes = changes },
+                } });
+            }
+
+            // Incorrect argument count - provide info action (no auto-fix, too complex)
+            if (std.mem.containsAtLeast(u8, message, 1, "Expected") and
+                std.mem.containsAtLeast(u8, message, 1, "arguments"))
+            {
+                try actions.append(arena, .{ .CodeAction = .{
+                    .title = "Incorrect argument count",
+                    .kind = .quickfix,
+                    .diagnostics = diag_arr,
+                    .isPreferred = false,
+                } });
+            }
+
+            // Unknown method - suggest similar methods (placeholder for now)
+            if (std.mem.containsAtLeast(u8, message, 1, "Unknown") and
+                std.mem.containsAtLeast(u8, message, 1, "method"))
+            {
+                try actions.append(arena, .{ .CodeAction = .{
+                    .title = "Check method name spelling",
+                    .kind = .quickfix,
+                    .diagnostics = diag_arr,
+                } });
+            }
+        }
+
+        if (actions.items.len == 0) return null;
+        return actions.items;
+    }
+
+    pub fn @"workspace/symbol"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.WorkspaceSymbolParams,
+    ) !lsp.ResultType("workspace/symbol") {
+        const query = params.query;
+        const query_lower = try std.ascii.allocLowerString(arena, query);
+        var symbols: std.ArrayListUnmanaged(types.SymbolInformation) = .empty;
+
+        var iter = self.files.iterator();
+        while (iter.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            const doc = entry.value_ptr.*;
+
+            for (doc.module.statements) |stmt| {
+                switch (stmt) {
+                    .ClassStmt => |class_stmt| {
+                        if (class_stmt.name) |name_token| {
+                            const class_name = name_token.name();
+                            const class_name_lower = try std.ascii.allocLowerString(arena, class_name);
+
+                            if (query.len == 0 or std.mem.indexOf(u8, class_name_lower, query_lower) != null) {
+                                try symbols.append(arena, .{
+                                    .name = class_name,
+                                    .kind = .Class,
+                                    .deprecated = false,
+                                    .location = .{
+                                        .uri = uri,
+                                        .range = tokenToRange(name_token),
+                                    },
+                                    .containerName = null,
+                                });
+                            }
+
+                            for (class_stmt.methods) |method| {
+                                switch (method) {
+                                    .Method => |m| {
+                                        if (m.name) |method_name_token| {
+                                            const method_name = method_name_token.name();
+                                            const method_name_lower = try std.ascii.allocLowerString(arena, method_name);
+
+                                            if (query.len == 0 or std.mem.indexOf(u8, method_name_lower, query_lower) != null) {
+                                                try symbols.append(arena, .{
+                                                    .name = method_name,
+                                                    .kind = .Method,
+                                                    .deprecated = false,
+                                                    .location = .{
+                                                        .uri = uri,
+                                                        .range = tokenToRange(method_name_token),
+                                                    },
+                                                    .containerName = class_name,
+                                                });
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    },
+                    .VarStmt => |var_stmt| {
+                        if (var_stmt.name) |name_token| {
+                            const var_name = name_token.name();
+                            const var_name_lower = try std.ascii.allocLowerString(arena, var_name);
+
+                            if (query.len == 0 or std.mem.indexOf(u8, var_name_lower, query_lower) != null) {
+                                try symbols.append(arena, .{
+                                    .name = var_name,
+                                    .kind = .Variable,
+                                    .deprecated = false,
+                                    .location = .{
+                                        .uri = uri,
+                                        .range = tokenToRange(name_token),
+                                    },
+                                    .containerName = null,
+                                });
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (symbols.items.len == 0) return null;
+        return .{ .array_of_SymbolInformation = symbols.items };
+    }
+
+    pub fn @"textDocument/foldingRange"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.FoldingRangeParams,
+    ) !?[]const types.FoldingRange {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var ranges: std.ArrayListUnmanaged(types.FoldingRange) = .empty;
+
+        // Scan source for brace pairs
+        var brace_stack: std.ArrayListUnmanaged(struct { offset: usize, line: u32 }) = .empty;
+        defer brace_stack.deinit(arena);
+
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+
+            if (token.type == .leftBrace) {
+                try brace_stack.append(arena, .{
+                    .offset = token.start,
+                    .line = @intCast(doc.source_file.lineAt(token.start) -| 1),
+                });
+            } else if (token.type == .rightBrace) {
+                if (brace_stack.items.len > 0) {
+                    const open = brace_stack.items[brace_stack.items.len - 1];
+                    _ = brace_stack.pop();
+                    const close_line: u32 = @intCast(doc.source_file.lineAt(token.start) -| 1);
+                    if (close_line > open.line) {
+                        try ranges.append(arena, .{
+                            .startLine = open.line,
+                            .endLine = close_line,
+                            .kind = .region,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Scan for multi-line block comments (/* */)
+        const source = doc.source_file.code;
+        var i: usize = 0;
+        while (i + 1 < source.len) : (i += 1) {
+            if (source[i] == '/' and source[i + 1] == '*') {
+                const comment_start = i;
+                i += 2;
+                var nesting: usize = 1;
+                while (i + 1 < source.len and nesting > 0) : (i += 1) {
+                    if (source[i] == '/' and source[i + 1] == '*') {
+                        nesting += 1;
+                        i += 1;
+                    } else if (source[i] == '*' and source[i + 1] == '/') {
+                        nesting -= 1;
+                        i += 1;
+                    }
+                }
+                const comment_end = i;
+                const start_line: u32 = @intCast(doc.source_file.lineAt(comment_start) -| 1);
+                const end_line: u32 = @intCast(doc.source_file.lineAt(comment_end) -| 1);
+                if (end_line > start_line) {
+                    try ranges.append(arena, .{
+                        .startLine = start_line,
+                        .endLine = end_line,
+                        .kind = .comment,
+                    });
+                }
+            }
+        }
+
+        if (ranges.items.len == 0) return null;
+        return ranges.items;
+    }
+
+    pub fn @"textDocument/selectionRange"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.SelectionRangeParams,
+    ) !?[]const types.SelectionRange {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var ranges: std.ArrayListUnmanaged(types.SelectionRange) = .empty;
+
+        for (params.positions) |pos| {
+            const offset = doc.positionToOffset(pos.line, pos.character) orelse continue;
+
+            // Level 1: Token range under cursor
+            var token_start = offset;
+            var token_end = offset;
+
+            if (offset < doc.src.len) {
+                while (token_start > 0 and isIdentChar(doc.src[token_start - 1])) {
+                    token_start -= 1;
+                }
+                while (token_end < doc.src.len and isIdentChar(doc.src[token_end])) {
+                    token_end += 1;
+                }
+            }
+
+            if (token_start == token_end and offset < doc.src.len) {
+                token_end = offset + 1;
+            }
+
+            const level1_range = rangeForOffsets(doc.source_file, token_start, token_end);
+
+            // Level 2: Expand to identifier chain (a.b.c)
+            var chain_start = token_start;
+            var chain_end = token_end;
+
+            // Expand backwards: check for `.identifier` pattern
+            while (chain_start > 1) {
+                if (doc.src[chain_start - 1] == '.') {
+                    const prev_end = chain_start - 1;
+                    var prev_start = prev_end;
+                    while (prev_start > 0 and isIdentChar(doc.src[prev_start - 1])) {
+                        prev_start -= 1;
+                    }
+                    if (prev_start < prev_end) {
+                        chain_start = prev_start;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Expand forwards: check for `.identifier` pattern
+            while (chain_end < doc.src.len) {
+                if (doc.src[chain_end] == '.') {
+                    const next_start = chain_end + 1;
+                    var next_end = next_start;
+                    while (next_end < doc.src.len and isIdentChar(doc.src[next_end])) {
+                        next_end += 1;
+                    }
+                    if (next_end > next_start) {
+                        chain_end = next_end;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            const level2_range = rangeForOffsets(doc.source_file, chain_start, chain_end);
+
+            // Level 3: Expand to enclosing delimiters (parentheses, brackets, braces)
+            var delim_start = chain_start;
+            var delim_end = chain_end;
+
+            // Find enclosing delimiters by scanning backwards and forwards
+            var depth_paren: i32 = 0;
+            var depth_bracket: i32 = 0;
+            var depth_brace: i32 = 0;
+
+            // Scan backwards for opening delimiter
+            var scan_back = chain_start;
+            while (scan_back > 0) {
+                scan_back -= 1;
+                const c = doc.src[scan_back];
+                switch (c) {
+                    ')' => depth_paren += 1,
+                    '(' => {
+                        if (depth_paren == 0) {
+                            delim_start = scan_back;
+                            break;
+                        }
+                        depth_paren -= 1;
+                    },
+                    ']' => depth_bracket += 1,
+                    '[' => {
+                        if (depth_bracket == 0) {
+                            delim_start = scan_back;
+                            break;
+                        }
+                        depth_bracket -= 1;
+                    },
+                    '}' => depth_brace += 1,
+                    '{' => {
+                        if (depth_brace == 0) {
+                            delim_start = scan_back;
+                            break;
+                        }
+                        depth_brace -= 1;
+                    },
+                    else => {},
+                }
+            }
+
+            // Only proceed with level 3 if we found an opener
+            if (delim_start < chain_start) {
+                const open_char = doc.src[delim_start];
+                const close_char: u8 = switch (open_char) {
+                    '(' => ')',
+                    '[' => ']',
+                    '{' => '}',
+                    else => 0,
+                };
+
+                if (close_char != 0) {
+                    var depth: i32 = 1;
+                    var scan_fwd = delim_start + 1;
+                    while (scan_fwd < doc.src.len and depth > 0) {
+                        const c = doc.src[scan_fwd];
+                        if (c == open_char) depth += 1;
+                        if (c == close_char) depth -= 1;
+                        scan_fwd += 1;
+                    }
+                    if (depth == 0) {
+                        delim_end = scan_fwd;
+                    }
+                }
+            }
+
+            const level3_range = rangeForOffsets(doc.source_file, delim_start, delim_end);
+
+            // Build parent chain: level3 -> level2 -> level1
+            var level3: ?*types.SelectionRange = null;
+            if (delim_start < chain_start or delim_end > chain_end) {
+                const l3 = try arena.create(types.SelectionRange);
+                l3.* = .{ .range = level3_range, .parent = null };
+                level3 = l3;
+            }
+
+            var level2: ?*types.SelectionRange = level3;
+            if (chain_start < token_start or chain_end > token_end) {
+                const l2 = try arena.create(types.SelectionRange);
+                l2.* = .{ .range = level2_range, .parent = level3 };
+                level2 = l2;
+            }
+
+            try ranges.append(arena, .{ .range = level1_range, .parent = level2 });
+        }
+
+        if (ranges.items.len == 0) return null;
+        return ranges.items;
+    }
+
     pub fn @"textDocument/semanticTokens/full"(
         self: *Handler,
         arena: std.mem.Allocator,
@@ -1051,6 +1588,228 @@ pub const Handler = struct {
         return .{ .data = data.items };
     }
 
+    pub fn @"textDocument/signatureHelp"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.SignatureHelpParams,
+    ) !?types.SignatureHelp {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+        const target_offset = doc.positionToOffset(params.position.line, params.position.character) orelse return null;
+
+        if (target_offset == 0) return null;
+
+        // Use lexer to properly skip strings/comments
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+
+        // Collect all tokens up to cursor position
+        var tokens: std.ArrayListUnmanaged(Token) = .empty;
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+            if (token.start >= target_offset) break;
+            try tokens.append(arena, token);
+        }
+
+        if (tokens.items.len == 0) return null;
+
+        // Find matching `(` by walking backwards through tokens
+        var paren_depth: i32 = 0;
+        var paren_idx: ?usize = null;
+        var comma_count: u32 = 0;
+
+        var i = tokens.items.len;
+        while (i > 0) {
+            i -= 1;
+            const token = tokens.items[i];
+
+            switch (token.type) {
+                .rightParen => paren_depth += 1,
+                .leftParen => {
+                    if (paren_depth == 0) {
+                        paren_idx = i;
+                        break;
+                    }
+                    paren_depth -= 1;
+                },
+                .comma => {
+                    if (paren_depth == 0) comma_count += 1;
+                },
+                else => {},
+            }
+        }
+
+        const open_paren_idx = paren_idx orelse return null;
+        if (open_paren_idx == 0) return null;
+
+        // Find function name - token before `(`
+        const name_token = tokens.items[open_paren_idx - 1];
+        if (name_token.type != .name) return null;
+        const func_name = name_token.name();
+
+        // Check if there's a receiver (token before name is `.`)
+        var receiver_name: ?[]const u8 = null;
+        if (open_paren_idx >= 2) {
+            const maybe_dot = tokens.items[open_paren_idx - 2];
+            if (maybe_dot.type == .dot and open_paren_idx >= 3) {
+                const recv_token = tokens.items[open_paren_idx - 3];
+                if (recv_token.type == .name) {
+                    receiver_name = recv_token.name();
+                }
+            }
+        }
+
+        // Try to find method in builtins or instance methods
+        if (receiver_name) |recv| {
+            // Check builtin class methods (e.g., System.print)
+            if (Scope.BUILTIN_METHODS.get(recv)) |methods| {
+                return self.buildSignatureHelp(arena, methods, func_name, comma_count);
+            }
+
+            // Check if receiver is a symbol with inferred type
+            for (doc.symbols.items) |sym| {
+                if (std.mem.eql(u8, sym.name, recv)) {
+                    if (sym.inferred_type) |inferred| {
+                        const type_name = @tagName(inferred);
+                        if (Scope.INSTANCE_METHODS.get(type_name)) |methods| {
+                            return self.buildSignatureHelp(arena, methods, func_name, comma_count);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Look up function in document symbols
+        for (doc.symbols.items) |sym| {
+            if (!std.mem.eql(u8, sym.name, func_name)) continue;
+            if (sym.fn_arity) |arity| {
+                var signatures: std.ArrayListUnmanaged(types.SignatureInformation) = .empty;
+                var params_list: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
+
+                for (0..arity) |_| {
+                    try params_list.append(arena, .{
+                        .label = .{ .string = "param" },
+                    });
+                }
+
+                try signatures.append(arena, .{
+                    .label = try std.fmt.allocPrint(arena, "{s}({d} args)", .{ func_name, arity }),
+                    .parameters = params_list.items,
+                });
+
+                // Safe activeParameter calculation (avoid underflow)
+                const active_param: u32 = if (arity == 0) 0 else @min(comma_count, @as(u32, @intCast(arity - 1)));
+
+                return .{
+                    .signatures = signatures.items,
+                    .activeSignature = 0,
+                    .activeParameter = active_param,
+                };
+            }
+        }
+
+        return null;
+    }
+
+    fn buildSignatureHelp(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        methods: []const Scope.BuiltinMethod,
+        func_name: []const u8,
+        comma_count: u32,
+    ) !?types.SignatureHelp {
+        _ = self;
+        var signatures: std.ArrayListUnmanaged(types.SignatureInformation) = .empty;
+
+        for (methods) |method| {
+            if (!std.mem.eql(u8, method.name, func_name)) continue;
+
+            var params_list: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
+            const arity = countParens(method.signature);
+            for (0..arity) |_| {
+                try params_list.append(arena, .{
+                    .label = .{ .string = "param" },
+                });
+            }
+
+            try signatures.append(arena, .{
+                .label = try arena.dupe(u8, method.signature),
+                .parameters = params_list.items,
+            });
+        }
+
+        if (signatures.items.len == 0) return null;
+
+        return .{
+            .signatures = signatures.items,
+            .activeSignature = 0,
+            .activeParameter = comma_count,
+        };
+    }
+
+    pub fn @"textDocument/documentSymbol"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.DocumentSymbolParams,
+    ) !lsp.ResultType("textDocument/documentSymbol") {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var symbols: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
+
+        // Extract symbols from module AST
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        const range = tokenToRange(name_token);
+                        const class_name = try arena.dupe(u8, name_token.name());
+
+                        // Collect methods first
+                        var method_children: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
+                        for (class_stmt.methods) |method_node| {
+                            if (method_node == .Method) {
+                                const method = method_node.Method;
+                                if (method.name) |method_name| {
+                                    const method_name_str = try arena.dupe(u8, method_name.name());
+                                    const method_range = tokenToRange(method_name);
+                                    try method_children.append(arena, .{
+                                        .name = method_name_str,
+                                        .kind = .Method,
+                                        .range = method_range,
+                                        .selectionRange = method_range,
+                                    });
+                                }
+                            }
+                        }
+
+                        try symbols.append(arena, .{
+                            .name = class_name,
+                            .kind = .Class,
+                            .range = range,
+                            .selectionRange = range,
+                            .children = method_children.items,
+                        });
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        const range = tokenToRange(name_token);
+                        const var_name = try arena.dupe(u8, name_token.name());
+                        try symbols.append(arena, .{
+                            .name = var_name,
+                            .kind = .Variable,
+                            .range = range,
+                            .selectionRange = range,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return .{ .array_of_DocumentSymbol = symbols.items };
+    }
+
     pub fn @"textDocument/inlayHint"(
         _: *Handler,
         _: std.mem.Allocator,
@@ -1064,6 +1823,19 @@ pub const Handler = struct {
         _: std.mem.Allocator,
         _: lsp.JsonRPCMessage.Response,
     ) !void {}
+
+    fn countParens(signature: []const u8) usize {
+        const open_index = std.mem.indexOfScalar(u8, signature, '(') orelse return 0;
+        const close_index = std.mem.indexOfScalarPos(u8, signature, open_index, ')') orelse return 0;
+        if (close_index <= open_index + 1) return 0;
+
+        var count: usize = 1;
+        var i = open_index + 1;
+        while (i < close_index) : (i += 1) {
+            if (signature[i] == ',') count += 1;
+        }
+        return count;
+    }
 
     fn loadFile(
         self: *Handler,

@@ -1,3 +1,6 @@
 zig-cache
 .zig-cache
 zig-out
+.npm
+.plan.md.swp
+plan.md

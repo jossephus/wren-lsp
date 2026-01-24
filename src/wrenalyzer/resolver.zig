@@ -11,11 +11,19 @@ const Reporter = @import("reporter.zig");
 
 pub const Resolver = @This();
 
+pub const ResolvedRef = struct {
+    use_token: Token,
+    decl_token: Token,
+    kind: Scope.Symbol.Kind,
+    is_write: bool,
+};
+
 allocator: std.mem.Allocator,
 scope: Scope,
 reporter: *Reporter,
 class_depth: usize,
 module: ?*ast.Module,
+refs_out: ?*std.ArrayListUnmanaged(ResolvedRef) = null,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -253,7 +261,17 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         self.checkBuiltinCallArity(recv, expr);
         self.checkUserMethodArity(recv, expr);
     } else {
-        if (self.scope.resolveOptional(expr.name) == null and self.class_depth == 0) {
+        if (self.scope.resolveOptional(expr.name)) |sym| {
+            if (self.refs_out) |refs| {
+                refs.append(self.allocator, .{
+                    .use_token = expr.name,
+                    .decl_token = sym.token,
+                    .kind = sym.kind,
+                    .is_write = false,
+                }) catch {};
+            }
+        } else {
+            // Report undefined symbol errors both at top-level and inside classes
             _ = self.scope.resolve(expr.name);
         }
     }
@@ -584,6 +602,38 @@ fn reportInfixTypeError(
 
 fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
     self.resolveNode(expr.value);
+
+    // Track reference to assignment target (write access)
+    switch (expr.target.*) {
+        .CallExpr => |call| {
+            if (call.receiver == null) {
+                if (self.scope.resolveOptional(call.name)) |sym| {
+                    if (self.refs_out) |refs| {
+                        refs.append(self.allocator, .{
+                            .use_token = call.name,
+                            .decl_token = sym.token,
+                            .kind = sym.kind,
+                            .is_write = true,
+                        }) catch {};
+                    }
+                }
+            }
+            // Don't call resolveNode for CallExpr - we already tracked it
+            // Just resolve the receiver if present
+            if (call.receiver) |recv| {
+                self.resolveNode(recv);
+            }
+            for (call.arguments) |*arg| {
+                self.resolveNode(arg);
+            }
+            if (call.blockArgument.*) |*block| {
+                self.resolveNode(block);
+            }
+            return;
+        },
+        else => {},
+    }
+
     self.resolveNode(expr.target);
 }
 
