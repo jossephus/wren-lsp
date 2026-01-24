@@ -22,15 +22,49 @@ jobs:
 
       - run: nix develop -L --verbose
 
-      - name: release-linux
-        run: nix develop -c zig build -Doptimize=ReleaseSmall
+      - name: release-linux-x86_64
+        run: |
+          nix develop -c zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-linux
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp dist/wren-lsp-linux-x86_64
 
-      - name: release-windows
-        run: nix develop -c zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSmall
+      - name: release-linux-aarch64
+        run: |
+          nix develop -c zig build -Doptimize=ReleaseSmall -Dtarget=aarch64-linux
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp dist/wren-lsp-linux-aarch64
+
+      - name: release-macos-x86_64
+        run: |
+          nix develop -c zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-macos
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp dist/wren-lsp-macos-x86_64
+
+      - name: release-macos-aarch64
+        run: |
+          nix develop -c zig build -Doptimize=ReleaseSmall -Dtarget=aarch64-macos
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp dist/wren-lsp-macos-aarch64
+
+      - name: release-windows-x86_64
+        run: |
+          nix develop -c zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSmall
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp.exe dist/wren-lsp-windows-x86_64.exe
+
+      - name: release-windows-aarch64
+        run: |
+          nix develop -c zig build -Dtarget=aarch64-windows -Doptimize=ReleaseSmall
+          mkdir -p dist
+          cp zig-out/bin/wren-lsp.exe dist/wren-lsp-windows-aarch64.exe
 
       - name: Upload Releases
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            ./zig-out/bin/wren-lsp.exe
-            ./zig-out/bin/wren-lsp
+            ./dist/wren-lsp-linux-x86_64
+            ./dist/wren-lsp-linux-aarch64
+            ./dist/wren-lsp-macos-x86_64
+            ./dist/wren-lsp-macos-aarch64
+            ./dist/wren-lsp-windows-x86_64.exe
+            ./dist/wren-lsp-windows-aarch64.exe

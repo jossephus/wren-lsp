@@ -22,28 +22,12 @@
           inherit overlays system;
         };
         packages = with pkgs; [
-          glfw
-          libGL
-          libxkbcommon
-          pkg-config
-          xorg.libxcb
-          xorg.libXft
-          xorg.libX11
-          xorg.libX11.dev
-          xorg.libXrandr
-          xorg.libXinerama
-          xorg.libXcursor
-          xorg.libXi
-          glfw-wayland
-          zigpkgs."0.14.0"
+          zigpkgs."0.15.2"
         ];
       in {
         devShell = pkgs.mkShell {
           buildInputs = packages;
-          nativeBuildInputs = with pkgs; [cmake pkg-config ncurses fontconfig freetype];
-          shellHook = ''
-            export SHELL=/usr/bin/bash
-          '';
+          nativeBuildInputs = with pkgs; [];
         };
       }
     );
