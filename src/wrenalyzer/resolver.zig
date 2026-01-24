@@ -44,7 +44,7 @@ fn resolveNode(self: *Resolver, node: *const ast.Node) void {
         .IfStmt => |stmt| self.visitIfStmt(stmt),
         .WhileStmt => |stmt| self.visitWhileStmt(stmt),
         .ReturnStmt => |stmt| self.visitReturnStmt(stmt),
-        .BreakStmt => {},
+        .BreakStmt, .ContinueStmt => {},
         .Body => |body| self.visitBody(body),
         .Method => |method| self.visitMethod(method),
         .CallExpr => |expr| self.visitCallExpr(expr),

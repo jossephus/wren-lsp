@@ -16,7 +16,9 @@ pub const Error = struct {
 
 lexer: Lexer,
 allocator: std.mem.Allocator,
+arena: std.heap.ArenaAllocator,
 current: ?Token,
+next: ?Token,
 previous: ?Token,
 errors: std.ArrayListUnmanaged(Error),
 reporter: ?*Reporter,
@@ -28,28 +30,66 @@ pub fn new(allocator: std.mem.Allocator, lexer: Lexer) !Parser {
 pub fn newWithReporter(allocator: std.mem.Allocator, lexer: Lexer, reporter: ?*Reporter) !Parser {
     return .{
         .allocator = allocator,
+        .arena = std.heap.ArenaAllocator.init(allocator),
         .lexer = lexer,
         .current = null,
+        .next = null,
         .previous = null,
         .errors = .empty,
         .reporter = reporter,
     };
 }
 
+pub fn deinit(self: *Parser) void {
+    self.lexer.deinit();
+    self.arena.deinit();
+    // errors are allocated via arena, so they're freed above
+}
+
+fn alloc(self: *Parser) std.mem.Allocator {
+    return self.arena.allocator();
+}
+
 pub fn parseModule(self: *Parser) !Module {
     self.ignoreLine();
 
     var statements: std.ArrayListUnmanaged(Node) = .empty;
+    var iterations: usize = 0;
+    const max_iterations: usize = 100000;
+
     while (self.peek() != Tag.eof) {
-        try statements.append(self.allocator, self.definition());
+        iterations += 1;
+        if (iterations > max_iterations) {
+            return error.ParseTimeout;
+        }
+
+        try statements.append(self.alloc(), self.definition());
 
         if (self.peek() == Tag.eof) break;
         self.consumeLine();
     }
-    return Module.init(try statements.toOwnedSlice(self.allocator));
+    return Module.init(try statements.toOwnedSlice(self.alloc()));
 }
 
 pub fn definition(self: *Parser) ast.Node {
+    while (self.match(Tag.hash) != null or self.match(Tag.hashBang) != null) {
+        _ = self.consume(Tag.name, "Expect attribute name.");
+        if (self.match(Tag.equal) != null) {
+            _ = self.expression();
+        }
+        if (self.match(Tag.leftParen) != null) {
+            while (self.peek() != Tag.rightParen and self.peek() != Tag.eof) {
+                _ = self.consume(Tag.name, "Expect attribute key.");
+                if (self.match(Tag.equal) != null) {
+                    _ = self.expression();
+                }
+                if (self.match(Tag.comma) == null) break;
+            }
+            _ = self.consume(Tag.rightParen, "Expect ')' after attribute.");
+        }
+        self.ignoreLine();
+    }
+
     if (self.match(Tag.classKeyword) != null) return self.finishClass(null);
 
     if (self.match(Tag.foreignKeyword) != null) {
@@ -59,6 +99,7 @@ pub fn definition(self: *Parser) ast.Node {
     }
 
     if (self.match(Tag.importKeyword) != null) {
+        self.ignoreLine();
         const path = self.consume(Tag.string, "Expect import path.");
         var variables: ?std.ArrayListUnmanaged(?Token) = null;
 
@@ -68,21 +109,25 @@ pub fn definition(self: *Parser) ast.Node {
             variables = .empty;
 
             while (true) {
-                variables.?.append(self.allocator, self.consume(Tag.name, "Expect imported variable name.")) catch @panic("Error allocating memory");
+                variables.?.append(self.alloc(), self.consume(Tag.name, "Expect imported variable name.")) catch @panic("Error allocating memory");
+                if (self.match(Tag.asKeyword) != null) {
+                    variables.?.append(self.alloc(), self.consume(Tag.name, "Expect alias name after 'as'.")) catch @panic("Error allocating memory");
+                }
                 if (self.match(Tag.comma) == null) break;
                 self.ignoreLine();
             }
         }
 
-        return .{ .ImportStmt = ast.ImportStmt.init(path, if (variables != null) variables.?.toOwnedSlice(self.allocator) catch @panic("Error allocating memory") else null) };
+        return .{ .ImportStmt = ast.ImportStmt.init(path, if (variables != null) variables.?.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory") else null) };
     }
 
     if (self.match(Tag.varKeyword) != null) {
         const name = self.consume(Tag.name, "Expect variable name.");
-        const initializer = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+        const initializer = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
         initializer.* = null;
 
         if (self.match(Tag.equal) != null) {
+            self.ignoreLine();
             initializer.* = self.expression();
         }
 
@@ -94,6 +139,7 @@ pub fn definition(self: *Parser) ast.Node {
 
 pub fn statement(self: *Parser) ast.Node {
     if (self.match(Tag.breakKeyword)) |_| return .{ .BreakStmt = ast.BreakStmt.init(self.previous) };
+    if (self.match(Tag.continueKeyword)) |_| return .{ .ContinueStmt = ast.ContinueStmt.init(self.previous) };
 
     if (self.match(Tag.ifKeyword)) |_| return self.ifStatement();
 
@@ -103,7 +149,7 @@ pub fn statement(self: *Parser) ast.Node {
 
     if (self.match(Tag.returnKeyword) != null) {
         const keyword = self.previous;
-        const value = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+        const value = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
         value.* = null;
         if (self.peek() != Tag.line) {
             value.* = self.expression();
@@ -124,18 +170,18 @@ pub fn ifStatement(self: *Parser) ast.Node {
     _ = self.consume(Tag.leftParen, "Expect '(' after 'if'.");
     self.ignoreLine();
 
-    const condition = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const condition = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     condition.* = self.expression();
 
     _ = self.consume(Tag.rightParen, "Expect ')' after if condition.");
 
-    const thenBranch = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const thenBranch = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     thenBranch.* = self.statement();
 
     var elseBranch: ?*ast.Node = null;
 
     if (self.match(Tag.elseKeyword)) |_| {
-        const elsePtr = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const elsePtr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         elsePtr.* = self.statement();
         elseBranch = elsePtr;
     }
@@ -146,11 +192,11 @@ pub fn whileStatement(self: *Parser) ast.Node {
     _ = self.consume(Tag.leftParen, "Expect '(' after 'while'.");
     self.ignoreLine();
 
-    const condition = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const condition = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     condition.* = self.expression();
 
     _ = self.consume(Tag.rightParen, "Expect ')' after while condition.");
-    const body = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const body = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     body.* = self.statement();
 
     return .{ .WhileStmt = ast.WhileStmt.init(condition, body) };
@@ -161,14 +207,14 @@ pub fn blockStatement(self: *Parser) ast.Node {
     self.ignoreLine();
 
     while (self.peek() != Tag.rightBrace and self.peek() != Tag.eof) {
-        statements.append(self.allocator, self.definition()) catch @panic("Error allocating memory");
+        statements.append(self.alloc(), self.definition()) catch @panic("Error allocating memory");
         if (self.peek() == Tag.rightBrace) break;
 
         self.consumeLine();
     }
     _ = self.consume(Tag.rightBrace, "Expect '}' after block.");
 
-    return .{ .BlockStmt = ast.BlockStmt.init(statements.toOwnedSlice(self.allocator) catch @panic("Error allocating memory")) };
+    return .{ .BlockStmt = ast.BlockStmt.init(statements.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory")) };
 }
 
 pub fn forStatement(self: *Parser) ast.Node {
@@ -177,11 +223,11 @@ pub fn forStatement(self: *Parser) ast.Node {
     _ = self.consume(Tag.inKeyword, "Expect 'in' after loop variable.");
 
     self.ignoreLine();
-    const iterator = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const iterator = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     iterator.* = self.expression();
 
     _ = self.consume(Tag.rightParen, "Expect ')' after loop expression.");
-    const body = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const body = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     body.* = self.statement();
 
     return .{ .ForStmt = ast.ForStmt.init(variable, iterator, body) };
@@ -192,15 +238,36 @@ pub fn assignment(self: *Parser) ast.Node {
     if (self.match(Tag.equal) == null) return expr;
 
     const equal = self.previous;
-    const target = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const target = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     target.* = expr;
-    const value = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const value = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     value.* = self.assignment();
     return ast.Node{ .AssignmentExpr = ast.AssignmentExpr.init(target, equal.?, value) };
 }
 
 pub fn conditional(self: *Parser) ast.Node {
-    const expr = self.logicalOr();
+    var expr = self.logicalOr();
+
+    if (self.match(Tag.question) != null) {
+        const questionToken = self.previous;
+        self.ignoreLine();
+        const thenBranch = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        thenBranch.* = self.expression();
+        self.ignoreLine();
+        _ = self.consume(Tag.colon, "Expect ':' after then branch of conditional operator.");
+        self.ignoreLine();
+        const elseBranch = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        elseBranch.* = self.conditional();
+
+        const condition = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        condition.* = expr;
+
+        const thenElse = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        thenElse.* = .{ .InfixExpr = ast.InfixExpr.init(thenBranch, self.previous.?, elseBranch) };
+
+        expr = .{ .InfixExpr = ast.InfixExpr.init(condition, questionToken.?, thenElse) };
+    }
+
     return expr;
 }
 
@@ -322,7 +389,7 @@ pub fn factor(self: *Parser) ast.Node {
 
 fn prefix(self: *Parser) ast.Node {
     if (self.matchAny(PREFIX_OPERATORS) != null) {
-        const pre = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const pre = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         pre.* = self.prefix();
         const node = ast.Node{ .PrefixExpr = ast.PrefixExpr.init(self.previous.?, pre) };
         return node;
@@ -334,16 +401,26 @@ fn call(self: *Parser) ast.Node {
     var expr = self.primary();
 
     while (true) {
+        // Allow method chaining across newlines (e.g., `foo\n  .bar()`)
+        // Only continue on newline if followed by `.` (not `[`, as `[` starts new list literals)
+        if (self.peek() == Tag.line) {
+            const next = self.peekNext();
+            if (next == Tag.dot) {
+                self.ignoreLine();
+            }
+        }
         if (self.match(Tag.leftBracket) != null) {
             const leftBracket = self.previous;
             const arguments = self.argumentsList();
+            self.ignoreLine();
             const rightBracket = self.consume(Tag.rightBracket, "Expect ']' after subscript arguments");
-            const receiver = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+            const receiver = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
             receiver.* = expr;
             expr = .{ .SubscriptExpr = ast.SubscriptExpr.init(receiver, leftBracket, arguments, rightBracket) };
         } else if (self.match(Tag.dot) != null) {
+            self.ignoreLine();
             const name = self.consume(Tag.name, "Expect method name after '.'.");
-            const receiver = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+            const receiver = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
             receiver.* = expr;
             expr = self.methodCall(receiver, name.?);
         } else {
@@ -356,7 +433,7 @@ fn call(self: *Parser) ast.Node {
 
 fn methodCall(self: *Parser, receiver: ?*ast.Node, name: Token) ast.Node {
     const arguments = self.finishCall();
-    const blockArgument = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    const blockArgument = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
     blockArgument.* = arguments.blockArgument;
     return .{ .CallExpr = ast.CallExpr.init(receiver, name, arguments.arguments, blockArgument) };
 }
@@ -376,16 +453,34 @@ fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
     self.ignoreLine();
 
     while (self.match(Tag.rightBrace) == null and self.peek() != Tag.eof) {
-        methods.append(self.allocator, self.method()) catch @panic("Error allocating memory");
+        methods.append(self.alloc(), self.method()) catch @panic("Error allocating memory");
 
         if (self.match(Tag.rightBrace) != null) break;
 
         self.consumeLine();
     }
-    return .{ .ClassStmt = ast.ClassStmt.init(foreignKeyword, name, superClass, methods.toOwnedSlice(self.allocator) catch @panic("Error allocating memory")) };
+    return .{ .ClassStmt = ast.ClassStmt.init(foreignKeyword, name, superClass, methods.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory")) };
 }
 
 fn method(self: *Parser) ast.Node {
+    while (self.match(Tag.hash) != null or self.match(Tag.hashBang) != null) {
+        _ = self.consume(Tag.name, "Expect attribute name.");
+        if (self.match(Tag.equal) != null) {
+            _ = self.expression();
+        }
+        if (self.match(Tag.leftParen) != null) {
+            while (self.peek() != Tag.rightParen and self.peek() != Tag.eof) {
+                _ = self.consume(Tag.name, "Expect attribute key.");
+                if (self.match(Tag.equal) != null) {
+                    _ = self.expression();
+                }
+                if (self.match(Tag.comma) == null) break;
+            }
+            _ = self.consume(Tag.rightParen, "Expect ')' after attribute.");
+        }
+        self.ignoreLine();
+    }
+
     var foreignKeyword: ?Token = null;
 
     if (self.match(Tag.foreignKeyword) != null) {
@@ -406,19 +501,52 @@ fn method(self: *Parser) ast.Node {
     var parameters: []Token = &[_]Token{};
     var allowParameters: bool = false;
 
+    const OPERATOR_METHODS = &[_]Tag{
+        Tag.bang,
+        Tag.tilde,
+        Tag.minus,
+        Tag.plus,
+        Tag.star,
+        Tag.slash,
+        Tag.percent,
+        Tag.less,
+        Tag.lessEqual,
+        Tag.greater,
+        Tag.greaterEqual,
+        Tag.equalEqual,
+        Tag.bangEqual,
+        Tag.amp,
+        Tag.pipe,
+        Tag.isKeyword,
+        Tag.caret,
+        Tag.lessLess,
+        Tag.greaterGreater,
+        Tag.dotDot,
+        Tag.dotDotDot,
+    };
+
     if (self.match(Tag.leftBracket) != null) {
         parameters = self.parameterList();
         _ = self.consume(Tag.rightBracket, "Expect ']' after parameters.");
-        allowParameters = false;
-    } else if (self.matchAny(&[_]Tag{ Tag.bang, Tag.tilde }) != null) {
-        allowParameters = false;
+        allowParameters = self.match(Tag.equal) != null;
+    } else if (self.matchAny(OPERATOR_METHODS) != null) {
+        allowParameters = true;
     } else {
         _ = self.consume(Tag.name, "Expect method name.");
         allowParameters = true;
     }
     name = self.previous;
 
-    if (self.match(Tag.leftParen) != null) {
+    if (self.match(Tag.equal) != null) {
+        if (self.match(Tag.leftParen) != null) {
+            self.ignoreLine();
+            if (self.match(Tag.rightParen) == null) {
+                parameters = self.parameterList();
+                self.ignoreLine();
+                _ = self.consume(Tag.rightParen, "Expect ')' after setter parameter.");
+            }
+        }
+    } else if (self.match(Tag.leftParen) != null) {
         if (!allowParameters) {
             self.err("Expecting parameters\n");
         }
@@ -432,7 +560,7 @@ fn method(self: *Parser) ast.Node {
         }
     }
 
-    const body = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    const body = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
     body.* = null;
     if (foreignKeyword == null) {
         _ = self.consume(Tag.leftBrace, "Expect '{' before method body.");
@@ -450,11 +578,13 @@ fn finishCall(self: *Parser) struct {
 
     const arguments = blk: {
         if (self.match(Tag.leftParen) != null) {
+            self.ignoreLine();
             if (self.match(Tag.rightParen) != null) {
                 break :blk &[_]ast.Node{};
             }
 
             const args = self.argumentsList();
+            self.ignoreLine();
             _ = self.consume(Tag.rightParen, "Expect ')' after arguments.");
             break :blk args;
         }
@@ -479,30 +609,30 @@ fn finishCall(self: *Parser) struct {
 }
 
 fn finishBody(self: *Parser, parameters: []Token) Node {
-    const empty_stmts = self.allocator.alloc(ast.Node, 0) catch @panic("Error allocating memory");
+    const empty_stmts = self.alloc().alloc(ast.Node, 0) catch @panic("Error allocating memory");
     if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, empty_stmts) };
 
     if (!self.matchLine()) {
-        const expr = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const expr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         expr.* = self.expression();
         self.ignoreLine();
         _ = self.consume(Tag.rightBrace, "Expect '}' at end of block.");
         return .{ .Body = ast.Body.init(parameters, expr, null) };
     }
 
-    const empty_stmts2 = self.allocator.alloc(ast.Node, 0) catch @panic("Error allocating memory");
+    const empty_stmts2 = self.alloc().alloc(ast.Node, 0) catch @panic("Error allocating memory");
     if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, empty_stmts2) };
 
     var statements: std.ArrayListUnmanaged(ast.Node) = .empty;
 
     while (self.peek() != Tag.eof) {
-        statements.append(self.allocator, self.definition()) catch @panic("Finish Body: appending failed");
+        statements.append(self.alloc(), self.definition()) catch @panic("Finish Body: appending failed");
         self.consumeLine();
 
         if (self.match(Tag.rightBrace) != null) break;
     }
 
-    return .{ .Body = ast.Body.init(parameters, null, statements.toOwnedSlice(self.allocator) catch @panic("finishBody toOwnedSlice error")) };
+    return .{ .Body = ast.Body.init(parameters, null, statements.toOwnedSlice(self.alloc()) catch @panic("finishBody toOwnedSlice error")) };
 }
 
 fn argumentsList(self: *Parser) []ast.Node {
@@ -511,11 +641,11 @@ fn argumentsList(self: *Parser) []ast.Node {
     self.ignoreLine();
 
     while (true) {
-        arguments.append(self.allocator, self.expression()) catch @panic("Memory access limited");
+        arguments.append(self.alloc(), self.expression()) catch @panic("Memory access limited");
         if (self.match(Tag.comma) == null) break;
         self.ignoreLine();
     }
-    return arguments.toOwnedSlice(self.allocator) catch @panic("argumentsList Panic");
+    return arguments.toOwnedSlice(self.alloc()) catch @panic("argumentsList Panic");
 }
 
 fn parameterList(self: *Parser) []Token {
@@ -524,11 +654,11 @@ fn parameterList(self: *Parser) []Token {
     self.ignoreLine();
 
     while (true) {
-        arguments.append(self.allocator, self.consume(Tag.name, "Expect parameter name.").?) catch @panic("Memory access limited");
-        if (self.match(Tag.comma) != null) break;
+        arguments.append(self.alloc(), self.consume(Tag.name, "Expect parameter name.").?) catch @panic("Memory access limited");
+        if (self.match(Tag.comma) == null) break;
         self.ignoreLine();
     }
-    return arguments.toOwnedSlice(self.allocator) catch @panic("parameterList Panic");
+    return arguments.toOwnedSlice(self.alloc()) catch @panic("parameterList Panic");
 }
 
 fn superCall(self: *Parser) ast.Node {
@@ -539,7 +669,7 @@ fn superCall(self: *Parser) ast.Node {
     }
 
     const arguments = self.finishCall();
-    const blockArgument = self.allocator.create(?ast.Node) catch @panic("Error allocating memory");
+    const blockArgument = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
     blockArgument.* = arguments.blockArgument;
     return .{ .SuperExpr = ast.SuperExpr.init(name, arguments.arguments, blockArgument) };
 }
@@ -561,15 +691,40 @@ fn primary(self: *Parser) ast.Node {
 
     if (self.match(Tag.number) != null) return .{ .NumExpr = ast.NumExpr.init(self.previous.?) };
     if (self.match(Tag.string) != null) return .{ .StringExpr = ast.StringExpr.init(self.previous.?) };
+    if (self.match(Tag.interpolation) != null) return self.stringInterpolation();
 
     self.err("Expect Expression \n");
 
+    if (self.previous) |prev| {
+        return .{ .NullExpr = ast.NullExpr.init(prev) };
+    }
+    _ = self.consumeToken();
     return .{ .NullExpr = ast.NullExpr.init(self.previous.?) };
+}
+
+fn stringInterpolation(self: *Parser) ast.Node {
+    const firstToken = self.previous.?;
+
+    while (true) {
+        self.ignoreLine();
+        _ = self.expression();
+        self.ignoreLine();
+
+        if (self.match(Tag.string) != null) {
+            break;
+        }
+        if (self.match(Tag.interpolation) == null) {
+            self.err("Expect end of string interpolation.");
+            break;
+        }
+    }
+
+    return .{ .StringExpr = ast.StringExpr.init(firstToken) };
 }
 
 fn grouping(self: *Parser) ast.Node {
     const leftParent = self.previous.?;
-    const expr = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+    const expr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
     expr.* = self.expression();
     const rightParen = self.consume(Tag.rightParen, "Expect ')' after expression.");
     return ast.Node{ .GroupingExpr = ast.GroupingExpr.init(leftParent, expr, rightParen.?) };
@@ -581,10 +736,10 @@ fn listLiteral(self: *Parser) ast.Node {
 
     self.ignoreLine();
     while (self.peek() != Tag.rightBracket) {
-        const expr = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const expr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         expr.* = self.expression();
-        std.debug.print("listLiteral {any} \n", .{expr});
-        elements.append(self.allocator, expr.*) catch @panic("Error appending to list");
+
+        elements.append(self.alloc(), expr.*) catch @panic("Error appending to list");
 
         self.ignoreLine();
 
@@ -594,7 +749,7 @@ fn listLiteral(self: *Parser) ast.Node {
     }
 
     const rightBracket = self.consume(Tag.rightBracket, "Expect ']' after list elements.");
-    return ast.Node{ .ListExpr = ast.ListExpr.init(leftBracket, elements.toOwnedSlice(self.allocator) catch @panic("Error allocating memory"), rightBracket.?) };
+    return ast.Node{ .ListExpr = ast.ListExpr.init(leftBracket, elements.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory"), rightBracket.?) };
 }
 
 fn mapLiteral(self: *Parser) ast.Node {
@@ -603,9 +758,9 @@ fn mapLiteral(self: *Parser) ast.Node {
 
     self.ignoreLine();
     while (self.peek() != Tag.rightBrace) {
-        const key = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const key = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         key.* = self.expression();
-        entries.append(self.allocator, key.*) catch @panic("Error appending to list");
+        entries.append(self.alloc(), key.*) catch @panic("Error appending to list");
 
         self.ignoreLine();
 
@@ -613,9 +768,9 @@ fn mapLiteral(self: *Parser) ast.Node {
 
         self.ignoreLine();
 
-        const value = self.allocator.create(ast.Node) catch @panic("Error allocating memory");
+        const value = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
         value.* = self.expression();
-        entries.append(self.allocator, value.*) catch @panic("Error appending to list");
+        entries.append(self.alloc(), value.*) catch @panic("Error appending to list");
 
         self.ignoreLine();
 
@@ -625,7 +780,7 @@ fn mapLiteral(self: *Parser) ast.Node {
     }
 
     const rightBrace = self.consume(Tag.rightBrace, "Expect '}' after map entries.");
-    return ast.Node{ .MapExpr = ast.MapExpr.init(leftBrace, entries.toOwnedSlice(self.allocator) catch @panic("Error allocating memory"), rightBrace.?) };
+    return ast.Node{ .MapExpr = ast.MapExpr.init(leftBrace, entries.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory"), rightBrace.?) };
 }
 
 pub fn ignoreLine(self: *Parser) void {
@@ -657,11 +812,30 @@ pub fn matchAny(self: *Parser, tags: []const Tag) ?Token {
 }
 
 pub fn peek(self: *Parser) Tag {
-    if (self.current == null) self.current = self.lexer.readToken() catch @panic("Unexpected error");
+    if (self.current == null) {
+        if (self.next != null) {
+            self.current = self.next;
+            self.next = null;
+        } else {
+            self.current = self.lexer.readToken() catch @panic("Unexpected error");
+        }
+    }
     return self.current.?.type;
 }
 
+fn peekNext(self: *Parser) Tag {
+    _ = self.peek(); // Ensure current is populated
+    // Read the next token after current
+    const next = self.lexer.readToken() catch @panic("Unexpected error");
+    // Store it back by setting current to current, and we'll use next field
+    // Actually, simpler: just peek at the lexer's next token
+    // We need to be careful - the lexer advances. Store the result.
+    self.next = next;
+    return next.type;
+}
+
 fn consumeLine(self: *Parser) void {
+    if (self.peek() == Tag.eof) return;
     _ = self.consume(Tag.line, "Expect a new line.");
     self.ignoreLine();
 }
@@ -687,6 +861,7 @@ pub fn parseInfix(self: *Parser, types: []const Tag, parseOperands: fn (parser: 
 
     while (self.matchAny(types) != null) {
         const operator = self.previous;
+        self.ignoreLine();
         var right = parseOperands(self);
         expr = ast.Node{ .InfixExpr = ast.InfixExpr.init(&expr, operator.?, &right) };
     }
@@ -697,7 +872,7 @@ pub fn parseInfix(self: *Parser, types: []const Tag, parseOperands: fn (parser: 
 pub fn err(self: *Parser, message: []const u8) void {
     const error_token = if (self.current) |current| current else self.previous.?;
 
-    self.errors.append(self.allocator, .{
+    self.errors.append(self.alloc(), .{
         .message = message,
         .token = error_token,
     }) catch @panic("Error adding to errors");

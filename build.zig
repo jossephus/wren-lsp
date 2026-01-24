@@ -25,6 +25,25 @@ pub fn build(b: *std.Build) !void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const test_runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/wrenalyzer/test_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_runner = b.addExecutable(.{
+        .name = "test-runner",
+        .root_module = test_runner_mod,
+    });
+
+    b.installArtifact(test_runner);
+
+    const run_tests_cmd = b.addRunArtifact(test_runner);
+    run_tests_cmd.step.dependOn(b.getInstallStep());
+
+    const run_tests_step = b.step("test-wren", "Run parser tests against wren test suite");
+    run_tests_step.dependOn(&run_tests_cmd.step);
 }
 
 fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {

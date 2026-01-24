@@ -1,7 +1,7 @@
 const std = @import("std");
 const Token = @import("token.zig").Token;
 
-const NodeTag = enum { Module, AssignmentExpr, InfixExpr, PrefixExpr, NumExpr, NullExpr, GroupingExpr, ListExpr, MapExpr, BoolExpr, ThisExpr, FieldExpr, StaticFieldExpr, StringExpr, CallExpr, Body, SuperExpr, ClassStmt, Method, ImportStmt, VarStmt, BreakStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, BlockStmt, SubscriptExpr };
+const NodeTag = enum { Module, AssignmentExpr, InfixExpr, PrefixExpr, NumExpr, NullExpr, GroupingExpr, ListExpr, MapExpr, BoolExpr, ThisExpr, FieldExpr, StaticFieldExpr, StringExpr, CallExpr, Body, SuperExpr, ClassStmt, Method, ImportStmt, VarStmt, BreakStmt, ContinueStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, BlockStmt, SubscriptExpr };
 
 pub const Node = union(NodeTag) {
     Module: *Module,
@@ -26,6 +26,7 @@ pub const Node = union(NodeTag) {
     ImportStmt: ImportStmt,
     VarStmt: VarStmt,
     BreakStmt: BreakStmt,
+    ContinueStmt: ContinueStmt,
     IfStmt: IfStmt,
     ForStmt: ForStmt,
     WhileStmt: WhileStmt,
@@ -55,6 +56,7 @@ pub const Node = union(NodeTag) {
             .ImportStmt => |import| try import.toString(&buf),
             .VarStmt => |v| try v.toString(&buf),
             .BreakStmt => |break_| try break_.toString(&buf),
+            .ContinueStmt => |cont| try cont.toString(&buf),
             .IfStmt => |_if| try _if.toString(&buf),
             .ForStmt => |_for| try _for.toString(&buf),
             .WhileStmt => |_while| try _while.toString(&buf),
@@ -553,6 +555,20 @@ pub const BreakStmt = struct {
     pub fn toString(self: BreakStmt, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
         try fbs.writer().print("Break({any})", .{self.keyword.?});
+        return fbs.getWritten();
+    }
+};
+
+pub const ContinueStmt = struct {
+    keyword: ?Token,
+
+    pub fn init(keyword: ?Token) ContinueStmt {
+        return .{ .keyword = keyword };
+    }
+
+    pub fn toString(self: ContinueStmt, buf: []u8) ![]u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("Continue({any})", .{self.keyword.?});
         return fbs.getWritten();
     }
 };

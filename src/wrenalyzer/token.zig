@@ -41,11 +41,15 @@ pub const Token = struct {
         greaterGreater,
         equalEqual,
         bangEqual,
+        hash,
+        hashBang,
 
         // Keywords.
+        asKeyword,
         breakKeyword,
         classKeyword,
         constructKeyword,
+        continueKeyword,
         elseKeyword,
         falseKeyword,
         forKeyword,

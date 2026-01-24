@@ -26,6 +26,10 @@ pub fn new(allocator: std.mem.Allocator, path: []const u8, code: []const u8) !So
     };
 }
 
+pub fn deinit(self: *SourceFile) void {
+    self.allocator.free(self.lines);
+}
+
 pub fn columnAt(self: SourceFile, offset: usize) usize {
     var column: usize = 1;
 
