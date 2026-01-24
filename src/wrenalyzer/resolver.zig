@@ -487,6 +487,89 @@ fn containsArity(arities: []const usize, value: usize) bool {
     return false;
 }
 
+fn checkInfixTypes(self: *Resolver, expr: ast.InfixExpr) void {
+    const left_type = self.exprInferredType(expr.left) orelse return;
+    const right_type = self.exprInferredType(expr.right) orelse return;
+    const operator_type = expr.operator.type;
+
+    const is_num = left_type == .num and right_type == .num;
+    const is_string = left_type == .string and right_type == .string;
+
+    switch (operator_type) {
+        .plus => {
+            if (is_num or is_string) return;
+            self.reportInfixTypeError(expr.operator, "+", left_type, right_type, "num or string");
+        },
+        .minus, .star, .slash, .percent, .caret, .amp, .pipe, .lessLess, .greaterGreater => {
+            if (is_num) return;
+            self.reportInfixTypeError(expr.operator, operator_type, left_type, right_type, "num");
+        },
+        .less, .lessEqual, .greater, .greaterEqual => {
+            if (is_num or is_string) return;
+            self.reportInfixTypeError(expr.operator, operator_type, left_type, right_type, "num or string");
+        },
+        .dotDot, .dotDotDot => {
+            if (is_num) return;
+            self.reportInfixTypeError(expr.operator, operator_type, left_type, right_type, "num");
+        },
+        .ampAmp, .pipePipe => {
+            if (left_type == .bool_type and right_type == .bool_type) return;
+            self.reportInfixTypeError(expr.operator, operator_type, left_type, right_type, "bool");
+        },
+        .equalEqual, .bangEqual => return,
+        else => return,
+    }
+}
+
+fn exprInferredType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType {
+    return switch (node.*) {
+        .NumExpr => .num,
+        .StringExpr => .string,
+        .BoolExpr => .bool_type,
+        .NullExpr => .null_type,
+        .ListExpr => .list,
+        .MapExpr => .map,
+        .GroupingExpr => |expr| self.exprInferredType(expr.expression),
+        .PrefixExpr => |expr| self.exprInferredType(expr.right),
+        .CallExpr => |expr| self.inferCallExprType(expr),
+        else => null,
+    };
+}
+
+fn inferCallExprType(self: *Resolver, expr: ast.CallExpr) ?Scope.Symbol.InferredType {
+    if (expr.receiver != null) return null;
+    if (expr.arguments.len != 0) return null;
+    if (expr.blockArgument.* != null) return null;
+
+    const sym = self.scope.resolveOptional(expr.name) orelse return null;
+    if (sym.inferred_type) |inferred| return inferred;
+    if (sym.kind == .class) return .class_type;
+    return null;
+}
+
+fn reportInfixTypeError(
+    self: *Resolver,
+    operator: Token,
+    operator_name: anytype,
+    left_type: Scope.Symbol.InferredType,
+    right_type: Scope.Symbol.InferredType,
+    expected: []const u8,
+) void {
+    const op_name = switch (@TypeOf(operator_name)) {
+        Token.Tag => @tagName(operator_name),
+        []const u8 => operator_name,
+        else => "operator",
+    };
+
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Operator '{s}' expects {s}, found {s} and {s}",
+        .{ op_name, expected, @tagName(left_type), @tagName(right_type) },
+    ) catch "Invalid operand types";
+    self.reporter.reportError(operator, msg);
+}
+
 fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
     self.resolveNode(expr.value);
     self.resolveNode(expr.target);
@@ -495,6 +578,7 @@ fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
 fn visitInfixExpr(self: *Resolver, expr: ast.InfixExpr) void {
     self.resolveNode(expr.left);
     self.resolveNode(expr.right);
+    self.checkInfixTypes(expr);
 }
 
 fn visitPrefixExpr(self: *Resolver, expr: ast.PrefixExpr) void {

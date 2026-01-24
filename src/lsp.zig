@@ -817,7 +817,12 @@ pub const Handler = struct {
 
             for (reporter_diags, diags) |rdiag, *d| {
                 log.debug("Error is {s}", .{rdiag.message});
-                const message_src = if (rdiag.message.len == 0) "Unknown error" else rdiag.message;
+                var validated = rdiag.message;
+                if (!std.unicode.utf8ValidateSlice(validated)) {
+                    log.err("Invalid diagnostic message bytes (len={d})", .{validated.len});
+                    validated = "Invalid error message";
+                }
+                const message_src = if (validated.len == 0) "Unknown error" else validated;
                 const message = try arena.dupe(u8, message_src);
                 d.* = .{
                     .range = tokenToRange(rdiag.token),

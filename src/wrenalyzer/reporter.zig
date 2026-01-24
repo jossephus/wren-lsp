@@ -69,7 +69,8 @@ pub fn report(
     severity: Severity,
     related: []const Token,
 ) void {
-    const owned_message = self.allocator.dupe(u8, message) catch {
+    const validated = if (std.unicode.utf8ValidateSlice(message)) message else "Invalid error message";
+    const owned_message = self.allocator.dupe(u8, validated) catch {
         std.log.err("Failed to allocate diagnostic message", .{});
         return;
     };
