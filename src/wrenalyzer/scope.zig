@@ -13,6 +13,7 @@ pub const Symbol = struct {
     token: Token,
     kind: Kind,
     inferred_type: ?InferredType = null,
+    fn_arity: ?usize = null,
 
     pub const Kind = enum {
         variable,
@@ -206,10 +207,16 @@ pub fn deinit(self: *Scope) void {
 }
 
 pub fn declare(self: *Scope, name_token: Token, kind: Symbol.Kind) void {
-    self.declareWithType(name_token, kind, null);
+    self.declareWithType(name_token, kind, null, null);
 }
 
-pub fn declareWithType(self: *Scope, name_token: Token, kind: Symbol.Kind, inferred_type: ?Symbol.InferredType) void {
+pub fn declareWithType(
+    self: *Scope,
+    name_token: Token,
+    kind: Symbol.Kind,
+    inferred_type: ?Symbol.InferredType,
+    fn_arity: ?usize,
+) void {
     const name = name_token.name();
 
     var scope = &(self.scopes.items[self.scopes.items.len - 1] orelse {
@@ -230,6 +237,7 @@ pub fn declareWithType(self: *Scope, name_token: Token, kind: Symbol.Kind, infer
         .token = name_token,
         .kind = kind,
         .inferred_type = inferred_type,
+        .fn_arity = fn_arity,
     }) catch {
         self.reporter.reportError(name_token, "Failed to declare variable");
     };

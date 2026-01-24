@@ -107,20 +107,27 @@ fn visitBody(self: *Resolver, body: ast.Body) void {
 
 fn visitVarStmt(self: *Resolver, stmt: ast.VarStmt) void {
     var inferred_type: ?Scope.Symbol.InferredType = null;
+    var fn_arity: ?usize = null;
 
     if (stmt.initializer.*) |*initializer| {
         self.resolveNode(initializer);
         inferred_type = self.inferType(initializer);
+        if (inferred_type == .fn_type) {
+            fn_arity = self.inferFnArity(initializer);
+        }
     }
 
     if (stmt.name) |name| {
-        self.scope.declareWithType(name, .variable, inferred_type);
+        self.scope.declareWithType(name, .variable, inferred_type, fn_arity);
     }
 }
 
 fn inferType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType {
-    _ = self;
     return switch (node.*) {
+        .CallExpr => |expr| blk: {
+            if (self.isFnNewCall(expr)) break :blk .fn_type;
+            break :blk null;
+        },
         .NumExpr => .num,
         .StringExpr => .string,
         .BoolExpr => .bool_type,
@@ -129,6 +136,35 @@ fn inferType(self: *Resolver, node: *const ast.Node) ?Scope.Symbol.InferredType 
         .MapExpr => .map,
         else => null,
     };
+}
+
+fn inferFnArity(self: *Resolver, node: *const ast.Node) ?usize {
+    return switch (node.*) {
+        .CallExpr => |expr| blk: {
+            if (!self.isFnNewCall(expr)) break :blk null;
+            if (expr.blockArgument.*) |*block| {
+                return switch (block.*) {
+                    .Body => |body| body.parameters.len,
+                    else => null,
+                };
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn isFnNewCall(self: *Resolver, expr: ast.CallExpr) bool {
+    _ = self;
+    if (!std.mem.eql(u8, expr.name.name(), "new")) return false;
+    const receiver = expr.receiver orelse return false;
+    switch (receiver.*) {
+        .CallExpr => |recv_call| {
+            if (recv_call.receiver != null) return false;
+            return std.mem.eql(u8, recv_call.name.name(), "Fn");
+        },
+        else => return false,
+    }
 }
 
 fn visitImportStmt(self: *Resolver, stmt: ast.ImportStmt) void {
@@ -186,6 +222,8 @@ fn visitReturnStmt(self: *Resolver, stmt: ast.ReturnStmt) void {
 fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
     if (expr.receiver) |recv| {
         self.resolveNode(recv);
+        self.checkFnCallArity(recv, expr);
+        self.checkBuiltinCallArity(recv, expr);
     } else {
         if (self.scope.resolveOptional(expr.name) == null and self.class_depth == 0) {
             _ = self.scope.resolve(expr.name);
@@ -199,6 +237,116 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
     if (expr.blockArgument.*) |*block| {
         self.resolveNode(block);
     }
+}
+
+fn checkFnCallArity(self: *Resolver, receiver: *const ast.Node, expr: ast.CallExpr) void {
+    if (!std.mem.eql(u8, expr.name.name(), "call")) return;
+
+    const recv_call = switch (receiver.*) {
+        .CallExpr => |call| call,
+        else => return,
+    };
+
+    if (recv_call.receiver != null) return;
+
+    const sym = self.scope.resolveOptional(recv_call.name) orelse return;
+    if (sym.inferred_type != .fn_type) return;
+    const arity = sym.fn_arity orelse return;
+
+    if (expr.arguments.len == arity) return;
+
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Expected {d} arguments for call, found {d}",
+        .{ arity, expr.arguments.len },
+    ) catch "Incorrect argument count";
+    self.reporter.reportError(expr.name, msg);
+}
+
+fn checkBuiltinCallArity(self: *Resolver, receiver: *const ast.Node, expr: ast.CallExpr) void {
+    const inferred_type = self.receiverInferredType(receiver) orelse return;
+    const type_name = @tagName(inferred_type);
+    const methods = Scope.INSTANCE_METHODS.get(type_name) orelse return;
+
+    const call_name = expr.name.name();
+    var arg_count: usize = expr.arguments.len;
+    if (expr.blockArgument.* != null) {
+        arg_count += 1;
+    }
+
+    var arities: [8]usize = undefined;
+    var arity_len: usize = 0;
+    var matches_arity = false;
+    for (methods) |method| {
+        if (!std.mem.eql(u8, method.name, call_name)) continue;
+        const arity = builtinMethodArity(method.signature);
+        if (!containsArity(arities[0..arity_len], arity)) {
+            if (arity_len < arities.len) {
+                arities[arity_len] = arity;
+                arity_len += 1;
+            }
+        }
+        if (arity == arg_count) {
+            matches_arity = true;
+            break;
+        }
+    }
+
+    if (arity_len == 0 or matches_arity) return;
+
+    var list_buf: [64]u8 = undefined;
+    var list_stream = std.io.fixedBufferStream(&list_buf);
+    const list_writer = list_stream.writer();
+    for (arities[0..arity_len], 0..) |arity, i| {
+        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
+        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
+    }
+    const list_slice = list_stream.getWritten();
+
+    var buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Expected {s} arguments for {s}.{s}, found {d}",
+        .{ list_slice, type_name, call_name, arg_count },
+    ) catch "Incorrect argument count";
+    self.reporter.reportError(expr.name, msg);
+}
+
+fn receiverInferredType(self: *Resolver, receiver: *const ast.Node) ?Scope.Symbol.InferredType {
+    return switch (receiver.*) {
+        .StringExpr => .string,
+        .NumExpr => .num,
+        .BoolExpr => .bool_type,
+        .ListExpr => .list,
+        .MapExpr => .map,
+        .CallExpr => |call| blk: {
+            if (call.receiver != null) break :blk null;
+            const sym = self.scope.resolveOptional(call.name) orelse break :blk null;
+            break :blk sym.inferred_type;
+        },
+        else => null,
+    };
+}
+
+fn builtinMethodArity(signature: []const u8) usize {
+    const open_index = std.mem.indexOfScalar(u8, signature, '(') orelse return 0;
+    const close_index = std.mem.indexOfScalarPos(u8, signature, open_index, ')') orelse return 0;
+    if (close_index <= open_index + 1) return 0;
+
+    var count: usize = 1;
+    var i = open_index + 1;
+    while (i < close_index) : (i += 1) {
+        if (signature[i] == ',') count += 1;
+    }
+    return count;
+}
+
+fn containsArity(arities: []const usize, value: usize) bool {
+    for (arities) |arity| {
+        if (arity == value) return true;
+    }
+    return false;
 }
 
 fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {

@@ -48,6 +48,9 @@ pub fn init(allocator: std.mem.Allocator) Reporter {
 }
 
 pub fn deinit(self: *Reporter) void {
+    for (self.diagnostics.items) |diag| {
+        self.allocator.free(diag.message);
+    }
     self.diagnostics.deinit(self.allocator);
 }
 
@@ -66,12 +69,18 @@ pub fn report(
     severity: Severity,
     related: []const Token,
 ) void {
+    const owned_message = self.allocator.dupe(u8, message) catch {
+        std.log.err("Failed to allocate diagnostic message", .{});
+        return;
+    };
+
     self.diagnostics.append(self.allocator, .{
-        .message = message,
+        .message = owned_message,
         .token = token,
         .severity = severity,
         .related_tokens = related,
     }) catch {
+        self.allocator.free(owned_message);
         std.log.err("Failed to append diagnostic", .{});
     };
 }
@@ -92,5 +101,8 @@ pub fn errorCount(self: *const Reporter) usize {
 }
 
 pub fn clear(self: *Reporter) void {
+    for (self.diagnostics.items) |diag| {
+        self.allocator.free(diag.message);
+    }
     self.diagnostics.clearRetainingCapacity();
 }

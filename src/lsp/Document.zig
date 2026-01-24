@@ -19,6 +19,7 @@ pub const SymbolInfo = struct {
     token: Token,
     kind: Scope.Symbol.Kind,
     inferred_type: ?Scope.Symbol.InferredType,
+    fn_arity: ?usize,
 };
 
 module: ast.Module,
@@ -78,6 +79,7 @@ pub fn init(
                     .token = entry.value_ptr.token,
                     .kind = entry.value_ptr.kind,
                     .inferred_type = entry.value_ptr.inferred_type,
+                    .fn_arity = entry.value_ptr.fn_arity,
                 }) catch {};
             }
         }
