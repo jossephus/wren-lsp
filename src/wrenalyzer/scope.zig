@@ -266,12 +266,14 @@ fn resolveInternal(self: *Scope, name_token: Token, report_errors: bool) ?Symbol
     const name = name_token.name();
     var reached_class = false;
 
+    // First pass: search local scopes (inside class methods)
     var i: usize = self.scopes.items.len;
     while (i > 0) {
         i -= 1;
         const maybe_scope = self.scopes.items[i];
         if (maybe_scope == null) {
             reached_class = true;
+            // Don't break - continue searching in outer scopes
             continue;
         }
 

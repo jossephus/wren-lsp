@@ -91,6 +91,12 @@ pub const Handler = struct {
                 .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
                 .renameProvider = .{ .bool = true },
+                .documentSymbolProvider = .{ .bool = true },
+                .documentHighlightProvider = .{ .bool = true },
+                .signatureHelpProvider = .{
+                    .triggerCharacters = &[_][]const u8{ "(", "," },
+                },
+                .codeActionProvider = .{ .bool = true },
                 .documentFormattingProvider = .{ .bool = false },
                 .semanticTokensProvider = .{
                     .SemanticTokensOptions = .{
@@ -1517,6 +1523,228 @@ pub const Handler = struct {
         }
 
         return .{ .data = data.items };
+    }
+
+    pub fn @"textDocument/signatureHelp"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.SignatureHelpParams,
+    ) !?types.SignatureHelp {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+        const target_offset = doc.positionToOffset(params.position.line, params.position.character) orelse return null;
+
+        if (target_offset == 0) return null;
+
+        // Use lexer to properly skip strings/comments
+        var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
+
+        // Collect all tokens up to cursor position
+        var tokens: std.ArrayListUnmanaged(Token) = .empty;
+        while (true) {
+            const token = try lexer.readToken();
+            if (token.type == .eof) break;
+            if (token.start >= target_offset) break;
+            try tokens.append(arena, token);
+        }
+
+        if (tokens.items.len == 0) return null;
+
+        // Find matching `(` by walking backwards through tokens
+        var paren_depth: i32 = 0;
+        var paren_idx: ?usize = null;
+        var comma_count: u32 = 0;
+
+        var i = tokens.items.len;
+        while (i > 0) {
+            i -= 1;
+            const token = tokens.items[i];
+
+            switch (token.type) {
+                .rightParen => paren_depth += 1,
+                .leftParen => {
+                    if (paren_depth == 0) {
+                        paren_idx = i;
+                        break;
+                    }
+                    paren_depth -= 1;
+                },
+                .comma => {
+                    if (paren_depth == 0) comma_count += 1;
+                },
+                else => {},
+            }
+        }
+
+        const open_paren_idx = paren_idx orelse return null;
+        if (open_paren_idx == 0) return null;
+
+        // Find function name - token before `(`
+        const name_token = tokens.items[open_paren_idx - 1];
+        if (name_token.type != .name) return null;
+        const func_name = name_token.name();
+
+        // Check if there's a receiver (token before name is `.`)
+        var receiver_name: ?[]const u8 = null;
+        if (open_paren_idx >= 2) {
+            const maybe_dot = tokens.items[open_paren_idx - 2];
+            if (maybe_dot.type == .dot and open_paren_idx >= 3) {
+                const recv_token = tokens.items[open_paren_idx - 3];
+                if (recv_token.type == .name) {
+                    receiver_name = recv_token.name();
+                }
+            }
+        }
+
+        // Try to find method in builtins or instance methods
+        if (receiver_name) |recv| {
+            // Check builtin class methods (e.g., System.print)
+            if (Scope.BUILTIN_METHODS.get(recv)) |methods| {
+                return self.buildSignatureHelp(arena, methods, func_name, comma_count);
+            }
+
+            // Check if receiver is a symbol with inferred type
+            for (doc.symbols.items) |sym| {
+                if (std.mem.eql(u8, sym.name, recv)) {
+                    if (sym.inferred_type) |inferred| {
+                        const type_name = @tagName(inferred);
+                        if (Scope.INSTANCE_METHODS.get(type_name)) |methods| {
+                            return self.buildSignatureHelp(arena, methods, func_name, comma_count);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Look up function in document symbols
+        for (doc.symbols.items) |sym| {
+            if (!std.mem.eql(u8, sym.name, func_name)) continue;
+            if (sym.fn_arity) |arity| {
+                var signatures: std.ArrayListUnmanaged(types.SignatureInformation) = .empty;
+                var params_list: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
+
+                for (0..arity) |_| {
+                    try params_list.append(arena, .{
+                        .label = .{ .string = "param" },
+                    });
+                }
+
+                try signatures.append(arena, .{
+                    .label = try std.fmt.allocPrint(arena, "{s}({d} args)", .{ func_name, arity }),
+                    .parameters = params_list.items,
+                });
+
+                // Safe activeParameter calculation (avoid underflow)
+                const active_param: u32 = if (arity == 0) 0 else @min(comma_count, @as(u32, @intCast(arity - 1)));
+
+                return .{
+                    .signatures = signatures.items,
+                    .activeSignature = 0,
+                    .activeParameter = active_param,
+                };
+            }
+        }
+
+        return null;
+    }
+
+    fn buildSignatureHelp(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        methods: []const Scope.BuiltinMethod,
+        func_name: []const u8,
+        comma_count: u32,
+    ) !?types.SignatureHelp {
+        _ = self;
+        var signatures: std.ArrayListUnmanaged(types.SignatureInformation) = .empty;
+
+        for (methods) |method| {
+            if (!std.mem.eql(u8, method.name, func_name)) continue;
+
+            var params_list: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
+            const arity = countParens(method.signature);
+            for (0..arity) |_| {
+                try params_list.append(arena, .{
+                    .label = .{ .string = "param" },
+                });
+            }
+
+            try signatures.append(arena, .{
+                .label = try arena.dupe(u8, method.signature),
+                .parameters = params_list.items,
+            });
+        }
+
+        if (signatures.items.len == 0) return null;
+
+        return .{
+            .signatures = signatures.items,
+            .activeSignature = 0,
+            .activeParameter = comma_count,
+        };
+    }
+
+    pub fn @"textDocument/documentSymbol"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.DocumentSymbolParams,
+    ) !lsp.ResultType("textDocument/documentSymbol") {
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var symbols: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
+
+        // Extract symbols from module AST
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        const range = tokenToRange(name_token);
+                        const class_name = try arena.dupe(u8, name_token.name());
+
+                        // Collect methods first
+                        var method_children: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
+                        for (class_stmt.methods) |method_node| {
+                            if (method_node == .Method) {
+                                const method = method_node.Method;
+                                if (method.name) |method_name| {
+                                    const method_name_str = try arena.dupe(u8, method_name.name());
+                                    const method_range = tokenToRange(method_name);
+                                    try method_children.append(arena, .{
+                                        .name = method_name_str,
+                                        .kind = .Method,
+                                        .range = method_range,
+                                        .selectionRange = method_range,
+                                    });
+                                }
+                            }
+                        }
+
+                        try symbols.append(arena, .{
+                            .name = class_name,
+                            .kind = .Class,
+                            .range = range,
+                            .selectionRange = range,
+                            .children = method_children.items,
+                        });
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        const range = tokenToRange(name_token);
+                        const var_name = try arena.dupe(u8, name_token.name());
+                        try symbols.append(arena, .{
+                            .name = var_name,
+                            .kind = .Variable,
+                            .range = range,
+                            .selectionRange = range,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return .{ .array_of_DocumentSymbol = symbols.items };
     }
 
     pub fn @"textDocument/inlayHint"(
