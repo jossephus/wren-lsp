@@ -31,13 +31,15 @@ pub fn deinit(self: *SourceFile) void {
 }
 
 pub fn columnAt(self: SourceFile, offset: usize) usize {
+    if (offset == 0) return 1;
     var column: usize = 1;
 
     var i = offset - 1;
-    while (i >= 0) {
+    while (true) {
         if (self.bytes[i] == Chars.lineFeed.int()) break;
-        column = column + 1;
-        i = i - 1;
+        column += 1;
+        if (i == 0) break;
+        i -= 1;
     }
 
     return column;

@@ -207,13 +207,21 @@ pub const Handler = struct {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
         };
 
-        if (params.context) |ctx| {
-            if (ctx.triggerKind == .TriggerCharacter and ctx.triggerCharacter != null) {
-                if (std.mem.eql(u8, ctx.triggerCharacter.?, ".")) {
-                    if (try self.getMemberCompletions(arena, doc, params.position)) |items| {
-                        return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
-                    }
+        const should_check_members = blk: {
+            if (params.context) |ctx| {
+                if (ctx.triggerKind == .TriggerCharacter and ctx.triggerCharacter != null) {
+                    if (std.mem.eql(u8, ctx.triggerCharacter.?, ".")) break :blk true;
                 }
+            }
+
+            const offset = doc.positionToOffset(params.position.line, params.position.character) orelse break :blk false;
+            if (offset == 0) break :blk false;
+            break :blk doc.src[offset - 1] == '.';
+        };
+
+        if (should_check_members) {
+            if (try self.getMemberCompletions(arena, doc, params.position)) |items| {
+                return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
             }
         }
 

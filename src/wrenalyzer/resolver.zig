@@ -14,12 +14,14 @@ pub const Resolver = @This();
 allocator: std.mem.Allocator,
 scope: Scope,
 reporter: *Reporter,
+class_depth: usize,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
         .allocator = allocator,
         .scope = try Scope.init(allocator, reporter),
         .reporter = reporter,
+        .class_depth = 0,
     };
 }
 
@@ -67,11 +69,13 @@ fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
     }
 
     self.scope.beginClass();
+    self.class_depth += 1;
 
     for (stmt.methods) |*method| {
         self.resolveNode(method);
     }
 
+    self.class_depth -= 1;
     self.scope.endClass();
 }
 
@@ -183,7 +187,9 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
     if (expr.receiver) |recv| {
         self.resolveNode(recv);
     } else {
-        _ = self.scope.resolve(expr.name);
+        if (self.scope.resolveOptional(expr.name) == null and self.class_depth == 0) {
+            _ = self.scope.resolve(expr.name);
+        }
     }
 
     for (expr.arguments) |*arg| {

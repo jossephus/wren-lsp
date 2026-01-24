@@ -44,8 +44,8 @@ scopes: std.ArrayListUnmanaged(?std.StringHashMapUnmanaged(Symbol)),
 forward_references: std.ArrayListUnmanaged(Token),
 
 const BUILTINS = [_][]const u8{
-    "Bool",    "Class",   "Fiber",  "Fn",    "List",
-    "Map",     "Null",    "Num",    "Object", "Range",
+    "Bool",     "Class",  "Fiber",  "Fn",     "List",
+    "Map",      "Null",   "Num",    "Object", "Range",
     "Sequence", "String", "System",
 };
 
@@ -236,6 +236,14 @@ pub fn declareWithType(self: *Scope, name_token: Token, kind: Symbol.Kind, infer
 }
 
 pub fn resolve(self: *Scope, name_token: Token) ?Symbol {
+    return self.resolveInternal(name_token, true);
+}
+
+pub fn resolveOptional(self: *Scope, name_token: Token) ?Symbol {
+    return self.resolveInternal(name_token, false);
+}
+
+fn resolveInternal(self: *Scope, name_token: Token, report_errors: bool) ?Symbol {
     const name = name_token.name();
     var reached_class = false;
 
@@ -256,20 +264,25 @@ pub fn resolve(self: *Scope, name_token: Token) ?Symbol {
     if (reached_class) {
         if (name.len > 0 and std.ascii.isLower(name[0])) {
             return null;
-        } else {
-            if (self.scopes.items[0]) |module_scope| {
-                if (module_scope.get(name)) |sym| {
-                    return sym;
-                }
-            }
-            self.forward_references.append(self.allocator, name_token) catch {};
-            return null;
         }
+
+        if (self.scopes.items[0]) |module_scope| {
+            if (module_scope.get(name)) |sym| {
+                return sym;
+            }
+        }
+
+        if (report_errors) {
+            self.forward_references.append(self.allocator, name_token) catch {};
+        }
+        return null;
     }
 
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "Variable '{s}' is not defined", .{name}) catch "Variable not defined";
-    self.reporter.reportError(name_token, msg);
+    if (report_errors) {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Variable '{s}' is not defined", .{name}) catch "Variable not defined";
+        self.reporter.reportError(name_token, msg);
+    }
     return null;
 }
 

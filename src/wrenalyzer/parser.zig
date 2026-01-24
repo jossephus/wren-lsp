@@ -857,16 +857,24 @@ pub fn consumeToken(self: *Parser) ?Token {
 }
 
 pub fn parseInfix(self: *Parser, types: []const Tag, parseOperands: fn (parser: *Parser) ast.Node) ast.Node {
-    var expr = parseOperands(self);
+    const left = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+    left.* = parseOperands(self);
+
+    var current = left;
 
     while (self.matchAny(types) != null) {
         const operator = self.previous;
         self.ignoreLine();
-        var right = parseOperands(self);
-        expr = ast.Node{ .InfixExpr = ast.InfixExpr.init(&expr, operator.?, &right) };
+
+        const right = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        right.* = parseOperands(self);
+
+        const infix = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+        infix.* = .{ .InfixExpr = ast.InfixExpr.init(current, operator.?, right) };
+        current = infix;
     }
 
-    return expr;
+    return current.*;
 }
 
 pub fn err(self: *Parser, message: []const u8) void {
