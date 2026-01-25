@@ -29,7 +29,7 @@ module: ast.Module,
 bytes: []const u8,
 src: []const u8,
 language: lsp_namespace.Language,
-source_file: SourceFile,
+source_file: *SourceFile,
 reporter: Reporter,
 symbols: std.ArrayListUnmanaged(SymbolInfo),
 refs: std.ArrayListUnmanaged(ResolvedRef) = .empty,
@@ -40,6 +40,8 @@ pub fn deinit(doc: *Document, gpa: std.mem.Allocator) void {
     doc.reporter.deinit();
     doc.symbols.deinit(gpa);
     doc.refs.deinit(gpa);
+    doc.source_file.deinit();
+    gpa.destroy(doc.source_file);
 }
 
 pub fn init(
@@ -50,7 +52,8 @@ pub fn init(
     const code_point_iterator = (try unicode.Utf8View.init(src)).iterator();
     const bytes = code_point_iterator.bytes;
 
-    const source_file = try SourceFile.new(gpa, "index.wren", src);
+    const source_file = try gpa.create(SourceFile);
+    source_file.* = try SourceFile.new(gpa, "index.wren", src);
 
     var reporter = Reporter.init(gpa);
 

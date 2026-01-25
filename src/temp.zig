@@ -8,11 +8,11 @@ const SourceFile = wrenalyzer.SourceFile;
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const source_file = try SourceFile.new(allocator, "index.wren",
+    var source_file = try SourceFile.new(allocator, "index.wren",
         \\ 1 +
         \\  
     );
-    const lexer = try Lexer.new(allocator, source_file);
+    const lexer = try Lexer.new(allocator, &source_file);
 
     var parser = try Parser.new(allocator, lexer);
     const module = try parser.parseModule();

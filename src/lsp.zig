@@ -1929,7 +1929,7 @@ pub fn tokenToRange(token: Token) types.Range {
     };
 }
 
-fn rangeForOffsets(source_file: wrenalyzer.SourceFile, start: usize, end: usize) types.Range {
+fn rangeForOffsets(source_file: *const wrenalyzer.SourceFile, start: usize, end: usize) types.Range {
     const line_num = source_file.lineAt(start);
     const line: u32 = if (line_num > 0) @intCast(line_num - 1) else 0;
 
