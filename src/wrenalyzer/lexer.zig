@@ -31,12 +31,12 @@ pub const KeyWords = std.StaticStringMap(Tag).initComptime(.{
 });
 allocator: std.mem.Allocator,
 punctuators: std.AutoHashMap(Chars, []const Punc),
-source: SourceFile,
+source: *const SourceFile,
 interpolations: std.ArrayListUnmanaged(usize),
 start: usize,
 current: usize,
 
-pub fn new(allocator: std.mem.Allocator, source: SourceFile) !Lexer {
+pub fn new(allocator: std.mem.Allocator, source: *const SourceFile) !Lexer {
     return .{
         .allocator = allocator,
         .punctuators = try initPunctuators(allocator),
@@ -377,7 +377,7 @@ test "lexer handles hex numbers without panic" {
     const allocator = std.testing.allocator;
     const src = "static carriageReturn { 0x0d }";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
-    var lexer = try Lexer.new(allocator, source_file);
+    var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
     defer source_file.deinit();
 
@@ -393,7 +393,7 @@ test "lexer handles fields without panic" {
     const allocator = std.testing.allocator;
     const src = "_field _staticField";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
-    var lexer = try Lexer.new(allocator, source_file);
+    var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
     defer source_file.deinit();
 
@@ -408,7 +408,7 @@ test "lexer handles source ending with identifier" {
     const allocator = std.testing.allocator;
     const src = "name";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
-    var lexer = try Lexer.new(allocator, source_file);
+    var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
     defer source_file.deinit();
 
@@ -423,7 +423,7 @@ test "lexer handles source ending with number" {
     const allocator = std.testing.allocator;
     const src = "123";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
-    var lexer = try Lexer.new(allocator, source_file);
+    var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
     defer source_file.deinit();
 
@@ -438,7 +438,7 @@ test "lexer handles source ending with hex number" {
     const allocator = std.testing.allocator;
     const src = "0xFF";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
-    var lexer = try Lexer.new(allocator, source_file);
+    var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
     defer source_file.deinit();
 

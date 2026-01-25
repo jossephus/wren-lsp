@@ -111,7 +111,7 @@ fn testFile(allocator: std.mem.Allocator, path: []const u8) TestResult {
     };
     defer source_file.deinit();
 
-    const lexer = Lexer.new(allocator, source_file) catch |err| {
+    const lexer = Lexer.new(allocator, &source_file) catch |err| {
         return .{ .path = path, .success = expects_error, .error_msg = @errorName(err) };
     };
 

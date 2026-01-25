@@ -2,7 +2,7 @@ const std = @import("std");
 const SourceFile = @import("source_file.zig");
 
 pub const Token = struct {
-    source: SourceFile,
+    source: *const SourceFile,
     type: Tag,
     start: usize,
     length: usize,
@@ -89,7 +89,7 @@ pub const Token = struct {
         }
     };
 
-    pub fn new(source: SourceFile, @"type": Tag, start: usize, length: usize) Token {
+    pub fn new(source: *const SourceFile, @"type": Tag, start: usize, length: usize) Token {
         return .{
             .source = source,
             .type = @"type",

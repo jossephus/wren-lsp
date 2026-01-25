@@ -9,8 +9,8 @@ const source = @embedFile("test.wren");
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const source_file = try SourceFile.new(allocator, "index.wren", source);
-    const lexer = try Lexer.new(allocator, source_file);
+    var source_file = try SourceFile.new(allocator, "index.wren", source);
+    const lexer = try Lexer.new(allocator, &source_file);
 
     var parser = try Parser.new(allocator, lexer);
     const module = try parser.parseModule();

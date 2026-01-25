@@ -420,6 +420,9 @@ fn call(self: *Parser) ast.Node {
         } else if (self.match(Tag.dot) != null) {
             self.ignoreLine();
             const name = self.consume(Tag.name, "Expect method name after '.'.");
+            if (name == null or name.?.type != Tag.name) {
+                break;
+            }
             const receiver = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
             receiver.* = expr;
             expr = self.methodCall(receiver, name.?);
@@ -432,10 +435,13 @@ fn call(self: *Parser) ast.Node {
 }
 
 fn methodCall(self: *Parser, receiver: ?*ast.Node, name: Token) ast.Node {
+    // Copy the name token to heap to avoid stack corruption from deep call chains
+    const name_copy = self.alloc().create(Token) catch @panic("Error allocating memory");
+    name_copy.* = name;
     const arguments = self.finishCall();
     const blockArgument = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
     blockArgument.* = arguments.blockArgument;
-    return .{ .CallExpr = ast.CallExpr.init(receiver, name, arguments.arguments, blockArgument) };
+    return .{ .CallExpr = ast.CallExpr.init(receiver, name_copy.*, arguments.arguments, blockArgument) };
 }
 
 fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
@@ -678,7 +684,10 @@ fn primary(self: *Parser) ast.Node {
     if (self.match(Tag.leftParen) != null) return self.grouping();
     if (self.match(Tag.leftBracket) != null) return self.listLiteral();
     if (self.match(Tag.leftBrace) != null) return self.mapLiteral();
-    if (self.match(Tag.name) != null) return self.methodCall(null, self.previous.?);
+    if (self.match(Tag.name) != null) {
+        const name_tok = self.previous.?;
+        return self.methodCall(null, name_tok);
+    }
     if (self.match(Tag.superKeyword) != null) return self.superCall();
 
     if (self.match(Tag.trueKeyword) != null) return .{ .BoolExpr = ast.BoolExpr.init(true) };
@@ -887,5 +896,136 @@ pub fn err(self: *Parser, message: []const u8) void {
 
     if (self.reporter) |reporter| {
         reporter.reportError(error_token, message);
+    }
+}
+
+test "#3 - parser handles simple function call hi()" {
+    const allocator = std.testing.allocator;
+    const code = "hi()";
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+    const stmt = module.statements[0];
+    switch (stmt) {
+        .CallExpr => |call_expr| {
+            try std.testing.expectEqualStrings("hi", call_expr.name.name());
+            try std.testing.expectEqual(Token.Tag.name, call_expr.name.type);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "#3 - parser and resolver handle hi() correctly" {
+    const allocator = std.testing.allocator;
+    const code = "hi()";
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    var module = try parser.parseModule();
+
+    // Verify the CallExpr name token before resolution
+    const stmt = module.statements[0];
+    const call_expr = switch (stmt) {
+        .CallExpr => |c| c,
+        else => unreachable,
+    };
+
+    // This is the critical check: the name should be "hi", not ")"
+    try std.testing.expectEqualStrings("hi", call_expr.name.name());
+    try std.testing.expectEqual(Token.Tag.name, call_expr.name.type);
+
+    // Now run the resolver and check it doesn't crash with ')' error
+    var reporter = @import("reporter.zig").init(allocator);
+    defer reporter.deinit();
+
+    var resolver = try @import("resolver.zig").Resolver.init(allocator, &reporter);
+    defer resolver.deinit();
+
+    resolver.resolve(&module);
+
+    // Check that no error about ')' was reported
+    for (reporter.diagnostics.items) |diag| {
+        const contains_paren = std.mem.indexOf(u8, diag.message, "')'") != null;
+        if (contains_paren) {
+            std.debug.print("ERROR: Found ')' error: {s}\n", .{diag.message});
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "#3 - parser and resolver handle hi() inside class method" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\class Hello {
+        \\  static hi() {
+        \\    hi()
+        \\  }
+        \\}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    var module = try parser.parseModule();
+
+    // Verify the AST is correct - find the CallExpr inside the method
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.methods.len);
+    const method_node = switch (class_stmt.methods[0]) {
+        .Method => |m| m,
+        else => unreachable,
+    };
+    const body = switch (method_node.body.*.?) {
+        .Body => |b| b,
+        else => unreachable,
+    };
+    // The body should have one statement which is the hi() call
+    try std.testing.expect(body.statements != null);
+    try std.testing.expectEqual(@as(usize, 1), body.statements.?.len);
+    const call_expr = switch (body.statements.?[0]) {
+        .CallExpr => |c| c,
+        else => unreachable,
+    };
+    // This is the critical check
+    try std.testing.expectEqualStrings("hi", call_expr.name.name());
+    try std.testing.expectEqual(Token.Tag.name, call_expr.name.type);
+
+    // Now run the resolver and check it doesn't crash with ')' error
+    var reporter = @import("reporter.zig").init(allocator);
+    defer reporter.deinit();
+
+    var resolver = try @import("resolver.zig").Resolver.init(allocator, &reporter);
+    defer resolver.deinit();
+
+    resolver.resolve(&module);
+
+    // Check that no error about ')' was reported
+    for (reporter.diagnostics.items) |diag| {
+        const contains_paren = std.mem.indexOf(u8, diag.message, "')'") != null;
+        if (contains_paren) {
+            std.debug.print("ERROR: Found ')' error: {s}\n", .{diag.message});
+            try std.testing.expect(false);
+        }
     }
 }
