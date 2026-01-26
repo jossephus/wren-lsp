@@ -1836,11 +1836,53 @@ pub const Handler = struct {
     }
 
     pub fn @"textDocument/inlayHint"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.InlayHintParams,
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.InlayHintParams,
     ) !lsp.ResultType("textDocument/inlayHint") {
-        return null;
+        const doc = self.files.get(params.textDocument.uri) orelse return null;
+
+        var hints: std.ArrayListUnmanaged(types.InlayHint) = .empty;
+
+        // Add type hints for variables with inferred types
+        for (doc.symbols.items) |sym| {
+            if (sym.kind != .variable) continue;
+            const inferred = sym.inferred_type orelse continue;
+
+            // Skip unknown types
+            if (inferred == .unknown) continue;
+
+            // Position hint after the variable name
+            const end_offset = sym.token.start + sym.token.length;
+            const line: u32 = @intCast(doc.source_file.lineAt(end_offset) -| 1);
+            const line_start = doc.source_file.lines[line];
+            const character: u32 = @intCast(end_offset - line_start);
+
+            const type_name = switch (inferred) {
+                .num => "Num",
+                .string => "String",
+                .bool_type => "Bool",
+                .null_type => "Null",
+                .list => "List",
+                .map => "Map",
+                .range => "Range",
+                .fn_type => "Fn",
+                .fiber => "Fiber",
+                .class_type => sym.class_name orelse "Class",
+                .unknown => continue,
+            };
+
+            try hints.append(arena, .{
+                .position = .{ .line = line, .character = character },
+                .label = .{ .string = try std.fmt.allocPrint(arena, ": {s}", .{type_name}) },
+                .kind = .Type,
+                .paddingLeft = false,
+                .paddingRight = true,
+            });
+        }
+
+        if (hints.items.len == 0) return null;
+        return hints.items;
     }
 
     pub fn onResponse(
