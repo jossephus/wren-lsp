@@ -701,7 +701,13 @@ pub const Handler = struct {
     fn uriToPath(uri: []const u8) []const u8 {
         const prefix = "file://";
         if (std.mem.startsWith(u8, uri, prefix)) {
-            return uri[prefix.len..];
+            var path = uri[prefix.len..];
+            // On Windows, file URIs are file:///C:/path, which becomes /C:/path
+            // We need to remove the leading / on Windows
+            if (builtin.os.tag == .windows and path.len > 2 and path[0] == '/' and path[2] == ':') {
+                return path[1..];
+            }
+            return path;
         }
         return uri;
     }
