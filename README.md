@@ -11,6 +11,14 @@ LSP implementation for Wren.
 - [x] References
 - [x] Rename
 - [x] Semantic tokens
+- [x] Document symbols (outline)
+- [x] Signature help
+- [x] Document highlights
+- [x] Code actions (quick fixes)
+- [x] Workspace symbols
+- [x] Folding ranges
+- [x] Selection range
+- [x] Inlay hints (type hints for variables)
 
 ## Demo
 
@@ -18,14 +26,7 @@ LSP implementation for Wren.
 
 ## Roadmap
 
-- [ ] Document symbols (outline)
-- [ ] Signature help
-- [ ] Document highlights
-- [ ] Code actions (quick fixes)
-- [ ] Workspace symbols
-- [ ] Folding ranges
-- [ ] Selection range
-- [ ] Inlay hints
+- [ ] Call hierarchy
 - [ ] Cross-module navigation
 
 ## Releases
