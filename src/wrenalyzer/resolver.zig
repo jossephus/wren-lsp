@@ -260,7 +260,7 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         self.checkFnCallArity(recv, expr);
         self.checkBuiltinCallArity(recv, expr);
         self.checkUserMethodArity(recv, expr);
-        
+
         // Track method name as a reference (for hover/goto on method names)
         // Method names don't have a declaration we can resolve, but we track them
         // so hover shows something useful

@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) !void {
 
     const run_tests_step = b.step("test-wren", "Run parser tests against wren test suite");
     run_tests_step.dependOn(&run_tests_cmd.step);
+
+    const fmt_step = b.step("fmt", "Format Zig files");
+    const fmt_zig = b.addFmt(.{
+        .paths = &.{ "src", "build.zig" },
+        .exclude_paths = &.{"src/wrenalyzer/test.wren"},
+        .check = false,
+    });
+    fmt_step.dependOn(&fmt_zig.step);
 }
 
 fn build_wren_analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {

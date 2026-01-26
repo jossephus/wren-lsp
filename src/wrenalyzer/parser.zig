@@ -1061,7 +1061,7 @@ test "#4 - bare identifier reference should error if undefined" {
 
 test "#4 - assignment to undefined variable should error" {
     const allocator = std.testing.allocator;
-    const code = 
+    const code =
         \\Foo = Fn.new {|x|
         \\  System.print(x)
         \\}

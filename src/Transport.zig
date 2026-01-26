@@ -30,7 +30,7 @@ pub fn readJsonMessage(self: *Transport, allocator: std.mem.Allocator) ![]u8 {
         const json_message = try allocator.alloc(u8, header.content_length);
         errdefer allocator.free(json_message);
         try reader.readNoEof(json_message);
-        
+
         break :blk json_message;
     };
 

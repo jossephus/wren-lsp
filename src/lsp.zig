@@ -714,13 +714,13 @@ pub const Handler = struct {
     fn checkImportPaths(self: *Handler, doc: *Document, uri: []const u8) !void {
         const base_path = uriToPath(uri);
         const base_dir = std.fs.path.dirname(base_path) orelse base_path;
-    
+
         for (doc.module.statements) |stmt| {
             switch (stmt) {
                 .ImportStmt => |import_stmt| {
                     const path_token = import_stmt.path orelse continue;
                     const raw_path = stripQuotes(path_token.name());
-                    
+
                     // Reject imports with .wren extension
                     if (std.mem.endsWith(u8, raw_path, ".wren")) {
                         var buf: [256]u8 = undefined;
@@ -728,18 +728,18 @@ pub const Handler = struct {
                         doc.reporter.reportError(path_token, msg);
                         continue;
                     }
-                    
+
                     if (!isImportFilePath(raw_path)) continue;
-    
+
                     const with_ext = try ensureWrenExtension(self.gpa, raw_path);
                     defer if (with_ext.ptr != raw_path.ptr) self.gpa.free(with_ext);
-    
+
                     const full_path = if (std.fs.path.isAbsolute(with_ext))
                         with_ext
                     else
                         try std.fs.path.join(self.gpa, &.{ base_dir, with_ext });
                     defer if (full_path.ptr != with_ext.ptr) self.gpa.free(full_path);
-    
+
                     if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
                         continue;
                     } else |err| switch (err) {
