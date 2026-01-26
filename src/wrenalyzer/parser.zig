@@ -1029,3 +1029,65 @@ test "#3 - parser and resolver handle hi() inside class method" {
         }
     }
 }
+
+test "#4 - bare identifier reference should error if undefined" {
+    const allocator = std.testing.allocator;
+    const code = "Foo";
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    var module = try parser.parseModule();
+
+    var reporter = @import("reporter.zig").init(allocator);
+    defer reporter.deinit();
+
+    var resolver = try @import("resolver.zig").Resolver.init(allocator, &reporter);
+    defer resolver.deinit();
+
+    resolver.resolve(&module);
+
+    // Should report that Foo is not defined
+    try std.testing.expect(reporter.diagnostics.items.len > 0);
+    const has_foo_error = for (reporter.diagnostics.items) |diag| {
+        if (std.mem.indexOf(u8, diag.message, "Foo") != null) break true;
+    } else false;
+    try std.testing.expect(has_foo_error);
+}
+
+test "#4 - assignment to undefined variable should error" {
+    const allocator = std.testing.allocator;
+    const code = 
+        \\Foo = Fn.new {|x|
+        \\  System.print(x)
+        \\}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    var module = try parser.parseModule();
+
+    var reporter = @import("reporter.zig").init(allocator);
+    defer reporter.deinit();
+
+    var resolver = try @import("resolver.zig").Resolver.init(allocator, &reporter);
+    defer resolver.deinit();
+
+    resolver.resolve(&module);
+
+    // Should report that Foo is not defined (you can't assign to undefined vars)
+    try std.testing.expect(reporter.diagnostics.items.len > 0);
+    const has_foo_error = for (reporter.diagnostics.items) |diag| {
+        if (std.mem.indexOf(u8, diag.message, "Foo") != null) break true;
+    } else false;
+    try std.testing.expect(has_foo_error);
+}

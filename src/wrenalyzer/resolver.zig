@@ -616,6 +616,9 @@ fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
                             .is_write = true,
                         }) catch {};
                     }
+                } else {
+                    // Variable not found - report error
+                    _ = self.scope.resolve(call.name);
                 }
             }
             // Don't call resolveNode for CallExpr - we already tracked it
