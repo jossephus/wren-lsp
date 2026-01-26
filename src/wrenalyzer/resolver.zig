@@ -260,6 +260,18 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         self.checkFnCallArity(recv, expr);
         self.checkBuiltinCallArity(recv, expr);
         self.checkUserMethodArity(recv, expr);
+        
+        // Track method name as a reference (for hover/goto on method names)
+        // Method names don't have a declaration we can resolve, but we track them
+        // so hover shows something useful
+        if (self.refs_out) |refs| {
+            refs.append(self.allocator, .{
+                .use_token = expr.name,
+                .decl_token = expr.name, // Point to itself since no actual decl
+                .kind = .method,
+                .is_write = false,
+            }) catch {};
+        }
     } else {
         if (self.scope.resolveOptional(expr.name)) |sym| {
             if (self.refs_out) |refs| {

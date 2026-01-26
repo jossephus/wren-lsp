@@ -799,6 +799,25 @@ pub const Handler = struct {
             return null;
         };
 
+        // First check if cursor is on a resolved reference (use site or declaration)
+        if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            const kind_str = switch (resolved.kind) {
+                .variable => "variable",
+                .parameter => "parameter",
+                .class => "class",
+                .method => "method",
+                .field => "field",
+                .static_field => "static field",
+                .import_var => "import",
+            };
+            const name = resolved.use_token.name();
+            const content = try std.fmt.allocPrint(arena, "**{s}** `{s}`", .{ kind_str, name });
+            return .{
+                .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
+                .range = tokenToRange(resolved.use_token),
+            };
+        }
+
         var range: ?types.Range = null;
         const sym = doc.findSymbolAtPosition(
             params.position.line,
