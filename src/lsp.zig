@@ -1289,6 +1289,108 @@ pub const Handler = struct {
                 }
             }
 
+            if (resolved.kind == .field or resolved.kind == .static_field) {
+                const field_name = resolved.use_token.name();
+                log.info("definition: field/property access '{s}'", .{field_name});
+
+                if (self.findReceiverClassAtPosition(doc, resolved.use_token.start)) |receiver_name| {
+                    log.info("definition: found receiver '{s}'", .{receiver_name});
+
+                    var class_name: ?[]const u8 = null;
+                    var source_uri: ?[]const u8 = null;
+
+                    if (self.getSymbolSourceModule(arena, params.textDocument.uri, receiver_name)) |uri| {
+                        class_name = receiver_name;
+                        source_uri = uri;
+                        log.info("definition: receiver is imported class '{s}'", .{receiver_name});
+                    } else {
+                        for (doc.symbols.items) |sym| {
+                            if (std.mem.eql(u8, sym.name, receiver_name)) {
+                                if (sym.kind == .class) {
+                                    class_name = receiver_name;
+                                    log.info("definition: receiver '{s}' is local class", .{receiver_name});
+                                } else if (sym.class_name) |cn| {
+                                    class_name = cn;
+                                    log.info("definition: receiver '{s}' has class_name '{s}'", .{ receiver_name, cn });
+                                    source_uri = self.getSymbolSourceModule(arena, params.textDocument.uri, cn);
+                                    if (source_uri) |uri| {
+                                        log.info("definition: class '{s}' imported from '{s}'", .{ cn, uri });
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if (class_name == null) {
+                            if (self.findVariableClassFromSource(doc, receiver_name)) |cn| {
+                                class_name = cn;
+                                log.info("definition: inferred class '{s}' from source", .{cn});
+                                source_uri = self.getSymbolSourceModule(arena, params.textDocument.uri, cn);
+                            }
+                        }
+                    }
+
+                    if (class_name != null and source_uri != null) {
+                        if (self.files.get(source_uri.?) == null) {
+                            self.loadImportedFile(source_uri.?) catch {};
+                        }
+
+                        if (self.files.get(source_uri.?)) |source_doc| {
+                            // Try field first
+                            if (self.findFieldInClass(source_doc, class_name.?, field_name)) |field_token| {
+                                log.info("definition: found field in source module", .{});
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = source_uri.?,
+                                            .range = tokenToRange(field_token),
+                                        },
+                                    },
+                                };
+                            }
+                            // Try getter method (property)
+                            if (findMethodInClassWithKind(source_doc, class_name.?, field_name, .instance)) |method_token| {
+                                log.info("definition: found property getter in source module", .{});
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = source_uri.?,
+                                            .range = tokenToRange(method_token),
+                                        },
+                                    },
+                                };
+                            }
+                            log.info("definition: property not found in class", .{});
+                        }
+                    } else if (class_name != null) {
+                        // Try field first
+                        if (self.findFieldInClass(doc, class_name.?, field_name)) |field_token| {
+                            log.info("definition: found field in local class", .{});
+                            return .{
+                                .Definition = .{
+                                    .Location = .{
+                                        .uri = params.textDocument.uri,
+                                        .range = tokenToRange(field_token),
+                                    },
+                                },
+                            };
+                        }
+                        // Try getter method (property)
+                        if (findMethodInClassWithKind(doc, class_name.?, field_name, .instance)) |method_token| {
+                            log.info("definition: found property getter in local class", .{});
+                            return .{
+                                .Definition = .{
+                                    .Location = .{
+                                        .uri = params.textDocument.uri,
+                                        .range = tokenToRange(method_token),
+                                    },
+                                },
+                            };
+                        }
+                    }
+                }
+            }
+
             // Fall back to local definition
             log.info("definition: falling back to local definition", .{});
             return .{
@@ -1303,6 +1405,26 @@ pub const Handler = struct {
 
         // Fallback: check if cursor is on a declaration itself
         log.info("definition: no resolved ref, checking declaration", .{});
+
+        // Try to find property/field access in string interpolation or other context
+        const offset = doc.positionToOffset(params.position.line, params.position.character) orelse {
+            log.info("definition: could not convert position to offset", .{});
+            return null;
+        };
+
+        log.info("definition: checking for property access at offset {d}", .{offset});
+
+        // Look for pattern like "user.name" where cursor is on "name"
+        if (self.findPropertyAccessAtOffset(arena, doc, offset)) |prop_access| {
+            log.info("definition: FOUND PROPERTY ACCESS: receiver='{s}', field='{s}'", .{ prop_access.receiver, prop_access.field });
+
+            if (self.resolvePropertyDefinition(arena, doc, prop_access.receiver, prop_access.field, params.textDocument.uri)) |result| {
+                return result;
+            }
+
+            log.info("definition: property not found", .{});
+        }
+
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
@@ -1616,6 +1738,313 @@ pub const Handler = struct {
                     }
                 },
                 else => {},
+            }
+        }
+
+        return null;
+    }
+
+    /// Property access result from parsing "receiver.field"
+    const PropertyAccess = struct {
+        receiver: []const u8,
+        field: []const u8,
+    };
+
+    /// Try to find "receiver.field" property access using AST tokens.
+    fn findPropertyAccessAtOffset(self: *Handler, arena: std.mem.Allocator, doc: Document, offset: usize) ?PropertyAccess {
+        for (doc.module.statements) |stmt| {
+            if (self.findPropertyAccessInNode(arena, stmt, offset)) |access| {
+                return access;
+            }
+        }
+
+        return null;
+    }
+
+    fn findPropertyAccessInNode(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        node: wrenalyzer.Ast.Node,
+        offset: usize,
+    ) ?PropertyAccess {
+        switch (node) {
+            .CallExpr => |call| {
+                const start = call.name.start;
+                const end = start + call.name.length;
+                if (offset >= start and offset < end) {
+                    if (call.receiver) |receiver_ptr| {
+                        if (self.extractPropertyReceiverName(receiver_ptr.*)) |receiver_name| {
+                            const receiver_dup = arena.dupe(u8, receiver_name) catch return null;
+                            const field_dup = arena.dupe(u8, call.name.name()) catch return null;
+                            log.info("definition: parsed property access: '{s}.{s}'", .{ receiver_dup, field_dup });
+                            return .{ .receiver = receiver_dup, .field = field_dup };
+                        }
+                    }
+                }
+
+                if (call.receiver) |recv_ptr| {
+                    if (self.findPropertyAccessInNode(arena, recv_ptr.*, offset)) |access| {
+                        return access;
+                    }
+                }
+                for (call.arguments) |arg| {
+                    if (self.findPropertyAccessInNode(arena, arg, offset)) |access| {
+                        return access;
+                    }
+                }
+                if (call.blockArgument.*) |block| {
+                    if (self.findPropertyAccessInNode(arena, block, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .VarStmt => |var_stmt| {
+                if (var_stmt.initializer.*) |initializer| {
+                    if (self.findPropertyAccessInNode(arena, initializer, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .ClassStmt => |class_stmt| {
+                for (class_stmt.methods) |method_node| {
+                    if (self.findPropertyAccessInNode(arena, method_node, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .Method => |method| {
+                if (method.body.*) |body| {
+                    if (self.findPropertyAccessInNode(arena, body, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .Body => |body| {
+                if (body.expression) |expr_ptr| {
+                    if (self.findPropertyAccessInNode(arena, expr_ptr.*, offset)) |access| {
+                        return access;
+                    }
+                }
+                if (body.statements) |stmts| {
+                    for (stmts) |stmt| {
+                        if (self.findPropertyAccessInNode(arena, stmt, offset)) |access| {
+                            return access;
+                        }
+                    }
+                }
+            },
+            .BlockStmt => |block| {
+                for (block.statements) |stmt| {
+                    if (self.findPropertyAccessInNode(arena, stmt, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .IfStmt => |if_stmt| {
+                if (self.findPropertyAccessInNode(arena, if_stmt.condition.*, offset)) |access| {
+                    return access;
+                }
+                if (self.findPropertyAccessInNode(arena, if_stmt.thenBranch.*, offset)) |access| {
+                    return access;
+                }
+                if (if_stmt.elseBranch) |else_ptr| {
+                    if (self.findPropertyAccessInNode(arena, else_ptr.*, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .WhileStmt => |while_stmt| {
+                if (self.findPropertyAccessInNode(arena, while_stmt.condition.*, offset)) |access| {
+                    return access;
+                }
+                if (self.findPropertyAccessInNode(arena, while_stmt.body.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .ForStmt => |for_stmt| {
+                if (self.findPropertyAccessInNode(arena, for_stmt.iterator.*, offset)) |access| {
+                    return access;
+                }
+                if (self.findPropertyAccessInNode(arena, for_stmt.body.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .ReturnStmt => |ret| {
+                if (ret.value.*) |val| {
+                    if (self.findPropertyAccessInNode(arena, val, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .InfixExpr => |infix| {
+                if (self.findPropertyAccessInNode(arena, infix.left.*, offset)) |access| {
+                    return access;
+                }
+                if (self.findPropertyAccessInNode(arena, infix.right.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .PrefixExpr => |prefix| {
+                if (self.findPropertyAccessInNode(arena, prefix.right.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .AssignmentExpr => |assign| {
+                if (self.findPropertyAccessInNode(arena, assign.value.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .GroupingExpr => |group| {
+                if (self.findPropertyAccessInNode(arena, group.expression.*, offset)) |access| {
+                    return access;
+                }
+            },
+            .ListExpr => |list| {
+                for (list.elements) |elem| {
+                    if (self.findPropertyAccessInNode(arena, elem, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            .SubscriptExpr => |sub| {
+                if (self.findPropertyAccessInNode(arena, sub.receiver.*, offset)) |access| {
+                    return access;
+                }
+                for (sub.arguments) |arg| {
+                    if (self.findPropertyAccessInNode(arena, arg, offset)) |access| {
+                        return access;
+                    }
+                }
+            },
+            else => {},
+        }
+
+        return null;
+    }
+
+    fn extractPropertyReceiverName(_: *Handler, receiver: wrenalyzer.Ast.Node) ?[]const u8 {
+        switch (receiver) {
+            .CallExpr => |call| {
+                if (call.receiver != null) return null;
+                return call.name.name();
+            },
+            .ThisExpr => return "this",
+            .SuperExpr => return "super",
+            else => return null,
+        }
+    }
+
+    /// Resolve a property (receiver.field) to its definition.
+    /// Returns Definition location if found, null otherwise.
+    fn resolvePropertyDefinition(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        receiver_name: []const u8,
+        field_name: []const u8,
+        current_uri: []const u8,
+    ) ?lsp.ResultType("textDocument/definition") {
+        var class_name: ?[]const u8 = null;
+        var source_uri: ?[]const u8 = null;
+
+        if (self.getSymbolSourceModule(arena, current_uri, receiver_name)) |uri| {
+            class_name = receiver_name;
+            source_uri = uri;
+            log.info("definition: receiver is imported class '{s}'", .{receiver_name});
+        } else {
+            for (doc.symbols.items) |sym| {
+                if (std.mem.eql(u8, sym.name, receiver_name)) {
+                    if (sym.kind == .class) {
+                        class_name = receiver_name;
+                        log.info("definition: receiver is local class", .{});
+                    } else if (sym.class_name) |cn| {
+                        class_name = cn;
+                        log.info("definition: receiver has class_name '{s}'", .{cn});
+                        source_uri = self.getSymbolSourceModule(arena, current_uri, cn);
+                    }
+                    break;
+                }
+            }
+
+            if (class_name == null) {
+                if (self.findVariableClassFromSource(doc, receiver_name)) |cn| {
+                    class_name = cn;
+                    log.info("definition: inferred class '{s}' from source", .{cn});
+                    source_uri = self.getSymbolSourceModule(arena, current_uri, cn);
+                }
+            }
+        }
+
+        if (class_name != null and source_uri != null) {
+            if (self.files.get(source_uri.?) == null) {
+                self.loadImportedFile(source_uri.?) catch {};
+            }
+
+            if (self.files.get(source_uri.?)) |source_doc| {
+                // Try field first
+                if (self.findFieldInClass(source_doc, class_name.?, field_name)) |field_token| {
+                    log.info("definition: found field in source module", .{});
+                    return .{
+                        .Definition = .{
+                            .Location = .{
+                                .uri = source_uri.?,
+                                .range = tokenToRange(field_token),
+                            },
+                        },
+                    };
+                }
+                // Try getter method
+                if (findMethodInClassWithKind(source_doc, class_name.?, field_name, .instance)) |method_token| {
+                    log.info("definition: found property getter in source module", .{});
+                    return .{
+                        .Definition = .{
+                            .Location = .{
+                                .uri = source_uri.?,
+                                .range = tokenToRange(method_token),
+                            },
+                        },
+                    };
+                }
+            }
+        } else if (class_name != null) {
+            // Local class
+            if (self.findFieldInClass(doc, class_name.?, field_name)) |field_token| {
+                log.info("definition: found field in local class", .{});
+                return .{
+                    .Definition = .{
+                        .Location = .{
+                            .uri = current_uri,
+                            .range = tokenToRange(field_token),
+                        },
+                    },
+                };
+            }
+            if (findMethodInClassWithKind(doc, class_name.?, field_name, .instance)) |method_token| {
+                log.info("definition: found property getter in local class", .{});
+                return .{
+                    .Definition = .{
+                        .Location = .{
+                            .uri = current_uri,
+                            .range = tokenToRange(method_token),
+                        },
+                    },
+                };
+            }
+        }
+
+        return null;
+    }
+
+    fn findFieldInClass(_: *Handler, doc: Document, class_name: []const u8, field_name: []const u8) ?Token {
+        // Fields in wrenalyzer are tracked as symbols with kind .field or .static_field
+        // and have a class_name pointing to the owning class
+        for (doc.symbols.items) |sym| {
+            if ((sym.kind == .field or sym.kind == .static_field) and
+                sym.class_name != null and
+                std.mem.eql(u8, sym.class_name.?, class_name) and
+                std.mem.eql(u8, sym.name, field_name))
+            {
+                return sym.token;
             }
         }
 
