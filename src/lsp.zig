@@ -967,6 +967,100 @@ pub const Handler = struct {
         gop.value_ptr.* = doc;
     }
 
+    /// Load all imports for a file and build the import graph.
+    fn loadImportsForFile(self: *Handler, arena: std.mem.Allocator, uri: []const u8) !void {
+        const doc = self.files.get(uri) orelse return;
+        log.info("loadImportsForFile: processing '{s}'", .{uri});
+
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ImportStmt => |import_stmt| {
+                    const path_token = import_stmt.path orelse continue;
+                    const raw_path = stripQuotes(path_token.name());
+                    log.info("loadImportsForFile: found import '{s}'", .{raw_path});
+
+                    const import_uri = self.resolveImportUri(arena, uri, raw_path) catch |err| {
+                        log.info("loadImportsForFile: resolveImportUri failed for '{s}': {s}", .{ raw_path, @errorName(err) });
+                        continue;
+                    };
+                    log.info("loadImportsForFile: resolved '{s}' -> '{s}'", .{ raw_path, import_uri });
+
+                    if (!std.mem.startsWith(u8, import_uri, "file://")) {
+                        log.info("loadImportsForFile: skipping non-file URI '{s}'", .{import_uri});
+                        continue;
+                    }
+
+                    if (self.files.get(import_uri) == null) {
+                        self.loadImportedFile(import_uri) catch |err| {
+                            log.info("loadImportsForFile: failed to load '{s}': {s}", .{ import_uri, @errorName(err) });
+                            continue;
+                        };
+                        log.info("loadImportsForFile: loaded import file '{s}'", .{import_uri});
+                    }
+
+                    try self.registerImportEdge(uri, import_uri, import_stmt.variables);
+                    log.info("loadImportsForFile: registered edge to '{s}'", .{import_uri});
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Register an import edge in the reverse import graph.
+    fn registerImportEdge(
+        self: *Handler,
+        from_uri: []const u8,
+        to_uri: []const u8,
+        variables: ?[]?Token,
+    ) !void {
+        const gop = try self.reverse_imports.getOrPut(self.gpa, to_uri);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, to_uri);
+            gop.value_ptr.* = .empty;
+        }
+
+        var already_registered = false;
+        for (gop.value_ptr.items) |existing| {
+            if (std.mem.eql(u8, existing, from_uri)) {
+                already_registered = true;
+                break;
+            }
+        }
+        if (!already_registered) {
+            try gop.value_ptr.append(self.gpa, try self.gpa.dupe(u8, from_uri));
+        }
+
+        if (variables) |vars| {
+            for (vars) |maybe_token| {
+                if (maybe_token) |name_token| {
+                    const symbol_name = name_token.name();
+                    const key = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ from_uri, symbol_name });
+
+                    const sym_gop = try self.symbol_sources.getOrPut(self.gpa, key);
+                    if (!sym_gop.found_existing) {
+                        sym_gop.value_ptr.* = try self.gpa.dupe(u8, to_uri);
+                    } else {
+                        self.gpa.free(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get all files that import from the given module URI.
+    fn getImporters(self: *Handler, module_uri: []const u8) []const []const u8 {
+        if (self.reverse_imports.get(module_uri)) |importers| {
+            return importers.items;
+        }
+        return &.{};
+    }
+
+    /// Find which module a symbol was imported from in a given file.
+    fn getSymbolSourceModule(self: *Handler, arena: std.mem.Allocator, file_uri: []const u8, symbol_name: []const u8) ?[]const u8 {
+        const key = std.fmt.allocPrint(arena, "{s}:{s}", .{ file_uri, symbol_name }) catch return null;
+        return self.symbol_sources.get(key);
+    }
+
     pub fn @"textDocument/hover"(
         self: *Handler,
         arena: std.mem.Allocator,
