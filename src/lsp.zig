@@ -10,6 +10,12 @@ const wrenalyzer = @import("wrenalyzer");
 const Token = wrenalyzer.Token;
 const Scope = wrenalyzer.Scope;
 
+const resolution = @import("resolution/root.zig");
+const ConfigLoader = resolution.ConfigLoader;
+const ResolverChain = resolution.ResolverChain;
+const ResolveRequest = resolution.ResolveRequest;
+const DiagnosticSeverity = resolution.DiagnosticSeverity;
+
 pub const Language = enum {
     wren,
     pub fn fromSliceResilient(s: []const u8) ?Language {
@@ -29,17 +35,81 @@ const Document = @import("lsp/Document.zig");
 
 pub const log = std.log.scoped(.wren_lsp);
 
+/// Import edge: which symbols are imported from which module
+pub const ImportEdge = struct {
+    from_uri: []const u8,
+    to_uri: []const u8,
+    symbols: []const []const u8,
+};
+
 pub const Handler = struct {
     gpa: std.mem.Allocator,
     transport: *lsp.Transport,
     files: std.StringHashMapUnmanaged(Document) = .{},
     offset_encoding: offsets.Encoding = .@"utf-16",
+    config_loader: ConfigLoader,
+    resolver_chains: std.StringHashMapUnmanaged(ResolverChain) = .empty,
+    /// Maps module URI -> list of URIs that import from it
+    reverse_imports: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    /// Maps (importer URI, symbol name) -> source module URI
+    symbol_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, transport: *lsp.Transport) Handler {
         return .{
             .gpa = gpa,
             .transport = transport,
+            .config_loader = ConfigLoader.init(gpa),
         };
+    }
+
+    pub fn deinit(self: *Handler) void {
+        var iter = self.resolver_chains.iterator();
+        while (iter.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.resolver_chains.deinit(self.gpa);
+        self.config_loader.deinit();
+
+        var rev_iter = self.reverse_imports.iterator();
+        while (rev_iter.next()) |entry| {
+            for (entry.value_ptr.items) |uri| {
+                self.gpa.free(uri);
+            }
+            entry.value_ptr.deinit(self.gpa);
+            self.gpa.free(entry.key_ptr.*);
+        }
+        self.reverse_imports.deinit(self.gpa);
+
+        var sym_iter = self.symbol_sources.iterator();
+        while (sym_iter.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
+        }
+        self.symbol_sources.deinit(self.gpa);
+
+        var file_iter = self.files.iterator();
+        while (file_iter.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.gpa);
+        }
+        self.files.deinit(self.gpa);
+    }
+
+    fn getResolverChain(self: *Handler, uri: []const u8) !*ResolverChain {
+        const config = try self.config_loader.loadForFile(uri);
+        const project_root = config.project_root orelse ".";
+
+        const gop = try self.resolver_chains.getOrPut(self.gpa, project_root);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, project_root);
+            gop.value_ptr.* = try ResolverChain.init(self.gpa, config);
+        }
+        return gop.value_ptr;
+    }
+
+    fn getConfig(self: *Handler, uri: []const u8) resolution.Config {
+        return self.config_loader.loadForFile(uri) catch resolution.Config{};
     }
 
     pub fn initialize(
@@ -678,6 +748,36 @@ pub const Handler = struct {
         uri: []const u8,
         import_path: []const u8,
     ) ![]const u8 {
+        const config = self.getConfig(uri);
+        const project_root = config.project_root orelse ".";
+
+        const chain = self.getResolverChain(uri) catch {
+            return self.resolveImportUriFallback(arena, uri, import_path);
+        };
+
+        const request = ResolveRequest{
+            .importer_uri = uri,
+            .import_string = import_path,
+            .project_root = project_root,
+            .module_bases = config.workspace.roots,
+        };
+
+        if (chain.resolve(request)) |result| {
+            if (result.uri) |resolved_uri| {
+                return arena.dupe(u8, resolved_uri);
+            }
+            return arena.dupe(u8, result.canonical_id);
+        }
+
+        return self.resolveImportUriFallback(arena, uri, import_path);
+    }
+
+    fn resolveImportUriFallback(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        import_path: []const u8,
+    ) ![]const u8 {
         _ = self;
 
         const base_path = uriToPath(uri);
@@ -718,8 +818,11 @@ pub const Handler = struct {
     }
 
     fn checkImportPaths(self: *Handler, doc: *Document, uri: []const u8) !void {
-        const base_path = uriToPath(uri);
-        const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+        const config = self.getConfig(uri);
+        const diag_config = config.imports.diagnostics;
+        const project_root = config.project_root orelse ".";
+
+        const chain = self.getResolverChain(uri) catch null;
 
         for (doc.module.statements) |stmt| {
             switch (stmt) {
@@ -727,39 +830,110 @@ pub const Handler = struct {
                     const path_token = import_stmt.path orelse continue;
                     const raw_path = stripQuotes(path_token.name());
 
-                    // Reject imports with .wren extension
                     if (std.mem.endsWith(u8, raw_path, ".wren")) {
-                        var buf: [256]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&buf, "Import path should not include '.wren' extension", .{}) catch "Invalid import";
-                        doc.reporter.reportError(path_token, msg);
+                        if (diag_config.extension_in_import != .none) {
+                            self.reportImportDiagnostic(
+                                doc,
+                                path_token,
+                                "Import path should not include '.wren' extension",
+                                diag_config.extension_in_import,
+                            );
+                        }
                         continue;
                     }
 
-                    if (!isImportFilePath(raw_path)) continue;
-
-                    const with_ext = try ensureWrenExtension(self.gpa, raw_path);
-                    defer if (with_ext.ptr != raw_path.ptr) self.gpa.free(with_ext);
-
-                    const full_path = if (std.fs.path.isAbsolute(with_ext))
-                        with_ext
-                    else
-                        try std.fs.path.join(self.gpa, &.{ base_dir, with_ext });
-                    defer if (full_path.ptr != with_ext.ptr) self.gpa.free(full_path);
-
-                    if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
+                    if (hasSchemePrefix(raw_path)) {
+                        if (diag_config.unknown_scheme != .none) {
+                            if (chain) |c| {
+                                const request = ResolveRequest{
+                                    .importer_uri = uri,
+                                    .import_string = raw_path,
+                                    .project_root = project_root,
+                                    .module_bases = config.workspace.roots,
+                                };
+                                if (c.resolve(request)) |_| {
+                                    continue;
+                                }
+                            }
+                        }
                         continue;
-                    } else |err| switch (err) {
-                        error.FileNotFound => {
-                            var buf: [256]u8 = undefined;
-                            const msg = std.fmt.bufPrint(&buf, "Cannot find import '{s}'", .{raw_path}) catch "Cannot find import";
-                            doc.reporter.reportError(path_token, msg);
-                        },
-                        else => {},
+                    }
+
+                    if (chain) |c| {
+                        const request = ResolveRequest{
+                            .importer_uri = uri,
+                            .import_string = raw_path,
+                            .project_root = project_root,
+                            .module_bases = config.workspace.roots,
+                        };
+                        if (c.resolve(request)) |result| {
+                            if (result.kind == .file and result.uri != null) {
+                                const resolved_path = uriToPath(result.uri.?);
+                                if (std.fs.cwd().access(resolved_path, .{ .mode = .read_only })) |_| {
+                                    continue;
+                                } else |_| {}
+                            } else if (result.kind == .virtual) {
+                                continue;
+                            }
+                        }
+                    } else {
+                        if (!isImportFilePath(raw_path)) continue;
+
+                        const base_path = uriToPath(uri);
+                        const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+                        const with_ext = try ensureWrenExtension(self.gpa, raw_path);
+                        defer if (with_ext.ptr != raw_path.ptr) self.gpa.free(with_ext);
+
+                        const full_path = if (std.fs.path.isAbsolute(with_ext))
+                            with_ext
+                        else
+                            try std.fs.path.join(self.gpa, &.{ base_dir, with_ext });
+                        defer if (full_path.ptr != with_ext.ptr) self.gpa.free(full_path);
+
+                        if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
+                            continue;
+                        } else |_| {}
+                    }
+
+                    if (diag_config.missing_import != .none) {
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "Cannot find import '{s}'", .{raw_path}) catch "Cannot find import";
+                        self.reportImportDiagnostic(doc, path_token, msg, diag_config.missing_import);
                     }
                 },
                 else => {},
             }
         }
+    }
+
+    fn reportImportDiagnostic(
+        _: *Handler,
+        doc: *Document,
+        token: Token,
+        message: []const u8,
+        severity: DiagnosticSeverity,
+    ) void {
+        switch (severity) {
+            .@"error" => doc.reporter.reportError(token, message),
+            .warning => doc.reporter.reportWarning(token, message),
+            .info, .hint => doc.reporter.reportInfo(token, message),
+            .none => {},
+        }
+    }
+
+    fn hasSchemePrefix(import_str: []const u8) bool {
+        if (std.mem.indexOf(u8, import_str, ":")) |colon_pos| {
+            if (colon_pos > 0 and colon_pos < import_str.len - 1) {
+                const before_colon = import_str[0..colon_pos];
+                for (before_colon) |c| {
+                    if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     fn isImportFilePath(path: []const u8) bool {
