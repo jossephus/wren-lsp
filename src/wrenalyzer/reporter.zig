@@ -62,6 +62,10 @@ pub fn reportWarning(self: *Reporter, token: Token, message: []const u8) void {
     self.report(token, message, .warning, &.{});
 }
 
+pub fn reportInfo(self: *Reporter, token: Token, message: []const u8) void {
+    self.report(token, message, .info, &.{});
+}
+
 pub fn report(
     self: *Reporter,
     token: Token,
