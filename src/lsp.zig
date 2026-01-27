@@ -1158,13 +1158,139 @@ pub const Handler = struct {
 
     pub fn @"textDocument/definition"(
         self: *Handler,
-        _: std.mem.Allocator,
+        arena: std.mem.Allocator,
         params: types.DefinitionParams,
     ) !lsp.ResultType("textDocument/definition") {
-        const doc = self.files.get(params.textDocument.uri) orelse return null;
+        log.info("definition: uri={s} line={d} col={d}", .{ params.textDocument.uri, params.position.line, params.position.character });
+
+        const doc = self.files.get(params.textDocument.uri) orelse {
+            log.info("definition: document not found", .{});
+            return null;
+        };
 
         // Use resolved reference index if available
         if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
+            log.info("definition: resolved symbol '{s}' kind={s}", .{ resolved.use_token.name(), @tagName(resolved.kind) });
+
+            // Check if this is an imported symbol - if so, jump to the source module
+            if (resolved.kind == .import_var or resolved.kind == .class) {
+                const symbol_name = resolved.use_token.name();
+                log.info("definition: looking for source module of '{s}'", .{symbol_name});
+
+                if (self.getSymbolSourceModule(arena, params.textDocument.uri, symbol_name)) |source_uri| {
+                    log.info("definition: found source module '{s}'", .{source_uri});
+
+                    // Load the source file if not already loaded
+                    if (self.files.get(source_uri) == null) {
+                        self.loadImportedFile(source_uri) catch {};
+                    }
+
+                    if (self.files.get(source_uri)) |source_doc| {
+                        // Find the symbol definition in the source module
+                        if (self.findSymbolInModule(source_doc, symbol_name)) |source_token| {
+                            log.info("definition: found symbol in source module", .{});
+                            return .{
+                                .Definition = .{
+                                    .Location = .{
+                                        .uri = source_uri,
+                                        .range = tokenToRange(source_token),
+                                    },
+                                },
+                            };
+                        } else {
+                            log.info("definition: symbol not found in source module", .{});
+                        }
+                    } else {
+                        log.info("definition: source doc not loaded", .{});
+                    }
+                } else {
+                    log.info("definition: no source module found for '{s}'", .{symbol_name});
+                }
+            }
+
+            if (resolved.kind == .method) {
+                const method_name = resolved.use_token.name();
+                log.info("definition: method call '{s}', looking for receiver class", .{method_name});
+
+                if (self.findReceiverClassAtPosition(doc, resolved.use_token.start)) |receiver_name| {
+                    log.info("definition: found receiver '{s}'", .{receiver_name});
+
+                    var class_name: ?[]const u8 = null;
+                    var source_uri: ?[]const u8 = null;
+                    var method_kind: MethodKind = .instance;
+
+                    if (self.getSymbolSourceModule(arena, params.textDocument.uri, receiver_name)) |uri| {
+                        class_name = receiver_name;
+                        source_uri = uri;
+                        method_kind = .class_level;
+                        log.info("definition: receiver is imported class '{s}'", .{receiver_name});
+                    } else {
+                        for (doc.symbols.items) |sym| {
+                            if (std.mem.eql(u8, sym.name, receiver_name)) {
+                                if (sym.kind == .class) {
+                                    class_name = receiver_name;
+                                    method_kind = .class_level;
+                                    log.info("definition: receiver '{s}' is local class", .{receiver_name});
+                                } else if (sym.class_name) |cn| {
+                                    class_name = cn;
+                                    method_kind = .instance;
+                                    log.info("definition: receiver '{s}' has class_name '{s}'", .{ receiver_name, cn });
+                                    source_uri = self.getSymbolSourceModule(arena, params.textDocument.uri, cn);
+                                    if (source_uri) |uri| {
+                                        log.info("definition: class '{s}' imported from '{s}'", .{ cn, uri });
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if (class_name == null) {
+                            if (self.findVariableClassFromSource(doc, receiver_name)) |cn| {
+                                class_name = cn;
+                                method_kind = .instance;
+                                log.info("definition: inferred class '{s}' from source", .{cn});
+                                source_uri = self.getSymbolSourceModule(arena, params.textDocument.uri, cn);
+                            }
+                        }
+                    }
+
+                    if (class_name != null and source_uri != null) {
+                        if (self.files.get(source_uri.?) == null) {
+                            self.loadImportedFile(source_uri.?) catch {};
+                        }
+
+                        if (self.files.get(source_uri.?)) |source_doc| {
+                            if (findMethodInClassWithKind(source_doc, class_name.?, method_name, method_kind)) |method_token| {
+                                log.info("definition: found method in source module", .{});
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = source_uri.?,
+                                            .range = tokenToRange(method_token),
+                                        },
+                                    },
+                                };
+                            }
+                            log.info("definition: method not found in class", .{});
+                        }
+                    } else if (class_name != null) {
+                        if (findMethodInClassWithKind(doc, class_name.?, method_name, method_kind)) |method_token| {
+                            log.info("definition: found method in local class", .{});
+                            return .{
+                                .Definition = .{
+                                    .Location = .{
+                                        .uri = params.textDocument.uri,
+                                        .range = tokenToRange(method_token),
+                                    },
+                                },
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Fall back to local definition
+            log.info("definition: falling back to local definition", .{});
             return .{
                 .Definition = .{
                     .Location = .{
@@ -1176,10 +1302,44 @@ pub const Handler = struct {
         }
 
         // Fallback: check if cursor is on a declaration itself
+        log.info("definition: no resolved ref, checking declaration", .{});
         const sym = doc.findSymbolAtPosition(
             params.position.line,
             params.position.character,
-        ) orelse return null;
+        ) orelse {
+            log.info("definition: no symbol at position", .{});
+            return null;
+        };
+
+        log.info("definition: found declaration '{s}' kind={s}", .{ sym.name, @tagName(sym.kind) });
+
+        // If it's an import_var declaration, jump to the source module
+        if (sym.kind == .import_var) {
+            log.info("definition: import_var, looking for source module", .{});
+            if (self.getSymbolSourceModule(arena, params.textDocument.uri, sym.name)) |source_uri| {
+                log.info("definition: found source module '{s}'", .{source_uri});
+
+                if (self.files.get(source_uri) == null) {
+                    self.loadImportedFile(source_uri) catch {};
+                }
+
+                if (self.files.get(source_uri)) |source_doc| {
+                    if (self.findSymbolInModule(source_doc, sym.name)) |source_token| {
+                        log.info("definition: found symbol in source module", .{});
+                        return .{
+                            .Definition = .{
+                                .Location = .{
+                                    .uri = source_uri,
+                                    .range = tokenToRange(source_token),
+                                },
+                            },
+                        };
+                    }
+                }
+            } else {
+                log.info("definition: no source module for import_var '{s}'", .{sym.name});
+            }
+        }
 
         return .{
             .Definition = .{
@@ -1191,6 +1351,401 @@ pub const Handler = struct {
         };
     }
 
+    /// Find a symbol (class, method) definition in a module.
+    fn findSymbolInModule(_: *Handler, doc: Document, symbol_name: []const u8) ?Token {
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) {
+                            return name_token;
+                        }
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) {
+                            return name_token;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        for (doc.symbols.items) |sym| {
+            if (std.mem.eql(u8, sym.name, symbol_name)) {
+                return sym.token;
+            }
+        }
+
+        return null;
+    }
+
+    /// Find the receiver identifier for a method call at the given token position.
+    /// Uses AST traversal to find the CallExpr and extract its receiver.
+    /// Returns null for chained calls, field receivers, or complex expressions.
+    fn findReceiverClassAtPosition(_: *Handler, doc: Document, method_start: usize) ?[]const u8 {
+        // Search for CallExpr with matching method name position
+        for (doc.module.statements) |stmt| {
+            if (findReceiverInNode(stmt, method_start)) |receiver_name| {
+                return receiver_name;
+            }
+        }
+        return null;
+    }
+
+    fn findReceiverInNode(node: wrenalyzer.Ast.Node, method_start: usize) ?[]const u8 {
+        switch (node) {
+            .CallExpr => |call| {
+                // Check if this is the call we're looking for
+                if (call.name.start == method_start) {
+                    return extractSimpleReceiverName(call);
+                }
+                // Recurse into receiver
+                if (call.receiver) |recv_ptr| {
+                    if (findReceiverInNode(recv_ptr.*, method_start)) |name| {
+                        return name;
+                    }
+                }
+                // Recurse into arguments
+                for (call.arguments) |arg| {
+                    if (findReceiverInNode(arg, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .VarStmt => |var_stmt| {
+                if (var_stmt.initializer.*) |initializer| {
+                    if (findReceiverInNode(initializer, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .ClassStmt => |class_stmt| {
+                for (class_stmt.methods) |method_node| {
+                    if (findReceiverInNode(method_node, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .Method => |method| {
+                if (method.body.*) |body| {
+                    if (findReceiverInNode(body, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .Body => |body| {
+                if (body.expression) |expr_ptr| {
+                    if (findReceiverInNode(expr_ptr.*, method_start)) |name| {
+                        return name;
+                    }
+                }
+                if (body.statements) |stmts| {
+                    for (stmts) |stmt| {
+                        if (findReceiverInNode(stmt, method_start)) |name| {
+                            return name;
+                        }
+                    }
+                }
+            },
+            .BlockStmt => |block| {
+                for (block.statements) |stmt| {
+                    if (findReceiverInNode(stmt, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .IfStmt => |if_stmt| {
+                if (findReceiverInNode(if_stmt.condition.*, method_start)) |name| {
+                    return name;
+                }
+                if (findReceiverInNode(if_stmt.thenBranch.*, method_start)) |name| {
+                    return name;
+                }
+                if (if_stmt.elseBranch) |else_ptr| {
+                    if (findReceiverInNode(else_ptr.*, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .WhileStmt => |while_stmt| {
+                if (findReceiverInNode(while_stmt.condition.*, method_start)) |name| {
+                    return name;
+                }
+                if (findReceiverInNode(while_stmt.body.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .ForStmt => |for_stmt| {
+                if (findReceiverInNode(for_stmt.iterator.*, method_start)) |name| {
+                    return name;
+                }
+                if (findReceiverInNode(for_stmt.body.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .ReturnStmt => |ret| {
+                if (ret.value.*) |val| {
+                    if (findReceiverInNode(val, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .InfixExpr => |infix| {
+                if (findReceiverInNode(infix.left.*, method_start)) |name| {
+                    return name;
+                }
+                if (findReceiverInNode(infix.right.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .PrefixExpr => |prefix| {
+                if (findReceiverInNode(prefix.right.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .AssignmentExpr => |assign| {
+                if (findReceiverInNode(assign.value.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .GroupingExpr => |group| {
+                if (findReceiverInNode(group.expression.*, method_start)) |name| {
+                    return name;
+                }
+            },
+            .ListExpr => |list| {
+                for (list.elements) |elem| {
+                    if (findReceiverInNode(elem, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+            .SubscriptExpr => |sub| {
+                if (findReceiverInNode(sub.receiver.*, method_start)) |name| {
+                    return name;
+                }
+                for (sub.arguments) |arg| {
+                    if (findReceiverInNode(arg, method_start)) |name| {
+                        return name;
+                    }
+                }
+            },
+
+            else => {},
+        }
+        return null;
+    }
+
+    /// Extract a simple identifier from a CallExpr's receiver.
+    /// Returns null for chained calls (receiver has a receiver), field accesses,
+    /// or complex expressions - only returns bare identifiers.
+    fn extractSimpleReceiverName(call: wrenalyzer.Ast.CallExpr) ?[]const u8 {
+        const receiver_ptr = call.receiver orelse return null;
+        const receiver = receiver_ptr.*;
+
+        switch (receiver) {
+            // Bare identifier: `Foo.method()` - receiver is CallExpr with null receiver
+            .CallExpr => |recv_call| {
+                // Chained call: `foo.bar.method()` - receiver has its own receiver
+                if (recv_call.receiver != null) return null;
+                return recv_call.name.name();
+            },
+            // Field access: `_field.method()` - can't resolve type
+            .FieldExpr => return null,
+            .StaticFieldExpr => return null,
+            // `this.method()` - return "this" for potential special handling
+            .ThisExpr => return "this",
+            // `super.method()` - return "super" for potential special handling
+            .SuperExpr => return "super",
+            // Complex expressions - can't resolve
+            else => return null,
+        }
+    }
+
+    const MethodKind = enum {
+        instance, // callable on instance: !static && !construct
+        class_level, // callable on class: static || construct
+        any,
+    };
+
+    fn findMethodInClass(_: *Handler, doc: Document, class_name: []const u8, method_name: []const u8) ?Token {
+        return findMethodInClassWithKind(doc, class_name, method_name, .any);
+    }
+
+    fn findMethodInClassWithKind(doc: Document, class_name: []const u8, method_name: []const u8, kind: MethodKind) ?Token {
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    const cls_name_token = class_stmt.name orelse continue;
+                    if (!std.mem.eql(u8, cls_name_token.name(), class_name)) continue;
+
+                    for (class_stmt.methods) |method_node| {
+                        switch (method_node) {
+                            .Method => |method| {
+                                const name_token = method.name orelse continue;
+                                const token_name = name_token.name();
+
+                                const is_static = method.staticKeyword != null;
+                                const is_constructor = method.constructKeyword != null;
+
+                                const kind_matches = switch (kind) {
+                                    .any => true,
+                                    .class_level => is_static or is_constructor,
+                                    .instance => !is_static and !is_constructor,
+                                };
+                                if (!kind_matches) continue;
+
+                                if (std.mem.eql(u8, token_name, method_name)) {
+                                    return name_token;
+                                }
+
+                                if (std.mem.startsWith(u8, token_name, method_name)) {
+                                    if (token_name.len > method_name.len) {
+                                        const next_char = token_name[method_name.len];
+                                        if (next_char == '(' or next_char == '=') {
+                                            return name_token;
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
+    /// Find the class name for a variable by examining its initializer in the AST.
+    /// Looks for patterns like `var x = ClassName.new(...)` where the initializer
+    /// is a constructor call.
+    fn findVariableClassFromSource(_: *Handler, doc: Document, var_name: []const u8) ?[]const u8 {
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .VarStmt => |var_stmt| {
+                    const name_token = var_stmt.name orelse continue;
+                    if (!std.mem.eql(u8, name_token.name(), var_name)) continue;
+
+                    const init_ptr = var_stmt.initializer;
+                    const initializer = init_ptr.* orelse continue;
+
+                    // Check if initializer is a CallExpr (method call)
+                    switch (initializer) {
+                        .CallExpr => |call| {
+                            // Must be a call to "new" (constructor)
+                            if (!std.mem.eql(u8, call.name.name(), "new")) continue;
+
+                            // Receiver must exist and be an identifier (class name)
+                            const receiver_ptr = call.receiver orelse continue;
+                            const receiver = receiver_ptr.*;
+
+                            // Receiver should be a CallExpr with null receiver (bare identifier)
+                            switch (receiver) {
+                                .CallExpr => |recv_call| {
+                                    if (recv_call.receiver != null) continue;
+                                    return recv_call.name.name();
+                                },
+                                else => continue,
+                            }
+                        },
+                        else => continue,
+                    }
+                },
+                .ClassStmt => |class_stmt| {
+                    // Also search inside class methods for local variables
+                    for (class_stmt.methods) |method_node| {
+                        switch (method_node) {
+                            .Method => |method| {
+                                const body_ptr = method.body;
+                                const body_node = body_ptr.* orelse continue;
+                                if (findVariableClassInBody(body_node, var_name)) |class_name| {
+                                    return class_name;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
+    fn findVariableClassInBody(body_node: wrenalyzer.Ast.Node, var_name: []const u8) ?[]const u8 {
+        switch (body_node) {
+            .Body => |body| {
+                const stmts = body.statements orelse return null;
+                for (stmts) |stmt| {
+                    switch (stmt) {
+                        .VarStmt => |var_stmt| {
+                            const name_token = var_stmt.name orelse continue;
+                            if (!std.mem.eql(u8, name_token.name(), var_name)) continue;
+
+                            const init_ptr = var_stmt.initializer;
+                            const initializer = init_ptr.* orelse continue;
+
+                            switch (initializer) {
+                                .CallExpr => |call| {
+                                    if (!std.mem.eql(u8, call.name.name(), "new")) continue;
+
+                                    const receiver_ptr = call.receiver orelse continue;
+                                    const receiver = receiver_ptr.*;
+
+                                    switch (receiver) {
+                                        .CallExpr => |recv_call| {
+                                            if (recv_call.receiver != null) continue;
+                                            return recv_call.name.name();
+                                        },
+                                        else => continue,
+                                    }
+                                },
+                                else => continue,
+                            }
+                        },
+                        .BlockStmt => |block| {
+                            for (block.statements) |inner| {
+                                if (findVariableClassInBody(inner, var_name)) |class_name| {
+                                    return class_name;
+                                }
+                            }
+                        },
+                        .IfStmt => |if_stmt| {
+                            if (findVariableClassInBody(if_stmt.thenBranch.*, var_name)) |class_name| {
+                                return class_name;
+                            }
+                            if (if_stmt.elseBranch) |else_ptr| {
+                                if (findVariableClassInBody(else_ptr.*, var_name)) |class_name| {
+                                    return class_name;
+                                }
+                            }
+                        },
+                        .WhileStmt => |while_stmt| {
+                            if (findVariableClassInBody(while_stmt.body.*, var_name)) |class_name| {
+                                return class_name;
+                            }
+                        },
+                        .ForStmt => |for_stmt| {
+                            if (findVariableClassInBody(for_stmt.body.*, var_name)) |class_name| {
+                                return class_name;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
     pub fn @"textDocument/references"(
         self: *Handler,
         arena: std.mem.Allocator,
@@ -1200,25 +1755,28 @@ pub const Handler = struct {
 
         const include_decl = params.context.includeDeclaration;
 
-        // Use resolved reference index
-        // First, find the declaration token for the symbol at cursor
         var decl_token_start: ?usize = null;
+        var symbol_name: ?[]const u8 = null;
+        var symbol_kind: ?Scope.Symbol.Kind = null;
 
-        // Check if cursor is on a use site
         if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
             decl_token_start = resolved.decl_token.start;
+            symbol_name = resolved.use_token.name();
+            symbol_kind = resolved.kind;
         } else {
-            // Check if cursor is on declaration itself
             if (doc.findSymbolAtPosition(params.position.line, params.position.character)) |sym| {
                 decl_token_start = sym.token.start;
+                symbol_name = sym.name;
+                symbol_kind = sym.kind;
             }
         }
 
         const target_start = decl_token_start orelse return null;
+        const target_name = symbol_name orelse return null;
 
         var locations: std.ArrayListUnmanaged(types.Location) = .empty;
 
-        // Find all uses that refer to this declaration
+        // Find all uses in current file that refer to this declaration
         for (doc.refs.items) |ref| {
             if (ref.decl_token.start == target_start) {
                 try locations.append(arena, .{
@@ -1241,8 +1799,69 @@ pub const Handler = struct {
             }
         }
 
+        // Cross-file references: if this is a class/method, search files that import this module
+        if (symbol_kind) |kind| {
+            if (kind == .class or kind == .method) {
+                const importers = self.getImporters(params.textDocument.uri);
+                for (importers) |importer_uri| {
+                    const importer_doc = self.files.get(importer_uri) orelse continue;
+
+                    // Check if this importer actually imports the symbol we're looking for
+                    if (!self.fileImportsSymbol(importer_doc, target_name, params.textDocument.uri)) {
+                        continue;
+                    }
+
+                    // Find uses of this symbol in the importing file
+                    for (importer_doc.refs.items) |ref| {
+                        if (std.mem.eql(u8, ref.use_token.name(), target_name)) {
+                            // Check that this is an import_var kind (imported symbol)
+                            if (ref.kind == .import_var or ref.kind == .class) {
+                                try locations.append(arena, .{
+                                    .uri = importer_uri,
+                                    .range = tokenToRange(ref.use_token),
+                                });
+                            }
+                        }
+                    }
+
+                    // Also check symbols (for class instantiation patterns)
+                    for (importer_doc.symbols.items) |sym| {
+                        if (std.mem.eql(u8, sym.name, target_name) and sym.kind == .import_var) {
+                            try locations.append(arena, .{
+                                .uri = importer_uri,
+                                .range = tokenToRange(sym.token),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         if (locations.items.len == 0) return null;
         return locations.items;
+    }
+
+    /// Check if a file imports a specific symbol from a specific module.
+    fn fileImportsSymbol(self: *Handler, doc: Document, symbol_name: []const u8, from_uri: []const u8) bool {
+        _ = self;
+        _ = from_uri;
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ImportStmt => |import_stmt| {
+                    if (import_stmt.variables) |vars| {
+                        for (vars) |maybe_token| {
+                            if (maybe_token) |name_token| {
+                                if (std.mem.eql(u8, name_token.name(), symbol_name)) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     pub fn @"textDocument/rename"(
@@ -2204,6 +2823,11 @@ pub const Handler = struct {
         }
 
         gop.value_ptr.* = doc;
+
+        // Load imports and build import graph
+        self.loadImportsForFile(arena, uri) catch |err| {
+            log.debug("Failed to load imports for {s}: {s}", .{ uri, @errorName(err) });
+        };
 
         const reporter_diags = doc.getDiagnostics();
         log.debug("document errors: {d}", .{reporter_diags.len});
