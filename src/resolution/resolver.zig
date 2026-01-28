@@ -246,18 +246,29 @@ pub const PathResolver = struct {
 pub const PluginResolver = struct {
     library_path: []const u8,
     fallback_to_builtin: bool,
-    handle: ?*anyopaque = null,
-    resolve_fn: ?*const fn (
+    handle: ?std.DynLib = null,
+    resolve_fn: ?ResolveFn = null,
+    free_fn: ?FreeFn = null,
+
+    const ResolveFn = *const fn (
         importer_uri: [*:0]const u8,
         importer_module_id: [*:0]const u8,
         import_string: [*:0]const u8,
         project_root: [*:0]const u8,
         module_bases: ?[*]const [*:0]const u8,
         module_bases_len: usize,
-    ) callconv(.c) WrenLspResolveResult = null,
-    free_fn: ?*const fn (result: WrenLspResolveResult) callconv(.c) void = null,
+    ) callconv(.c) WrenLspResolveResult;
+
+    const FreeFn = *const fn (result: WrenLspResolveResult) callconv(.c) void;
 
     const Self = @This();
+
+    /// Platform-specific shared library extension.
+    const native_lib_ext = switch (@import("builtin").os.tag) {
+        .windows => ".dll",
+        .macos => ".dylib",
+        else => ".so",
+    };
 
     pub fn create(allocator: std.mem.Allocator, cfg: types.PluginResolverConfig, project_root: ?[]const u8) !Resolver {
         const self = try allocator.create(Self);
@@ -266,30 +277,20 @@ pub const PluginResolver = struct {
             .fallback_to_builtin = cfg.fallback_to_builtin,
         };
 
-        const lib_path = if (std.mem.startsWith(u8, cfg.library, "./"))
-            if (project_root) |pr|
-                std.fs.path.join(allocator, &.{ pr, cfg.library[2..] }) catch cfg.library
-            else
-                cfg.library
-        else
-            cfg.library;
-
-        const lib_path_z = allocator.dupeZ(u8, lib_path) catch {
-            log.warn("Failed to load plugin: could not allocate path", .{});
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .resolve = &resolveImpl,
-                    .deinit = &deinitImpl,
-                },
-            };
+        const lib_path = resolveLibraryPath(allocator, cfg.library, project_root) orelse {
+            log.warn("Failed to load plugin: could not resolve path", .{});
+            return createResolver(self);
         };
-        defer allocator.free(lib_path_z);
+        defer allocator.free(lib_path);
 
-        self.handle = std.c.dlopen(lib_path_z.ptr, .{ .LAZY = true });
-        if (self.handle) |h| {
-            self.resolve_fn = @ptrCast(@alignCast(std.c.dlsym(h, "wren_lsp_resolve_module")));
-            self.free_fn = @ptrCast(@alignCast(std.c.dlsym(h, "wren_lsp_free_result")));
+        self.handle = std.DynLib.open(lib_path) catch |err| {
+            log.warn("Failed to load plugin library '{s}': {}", .{ lib_path, err });
+            return createResolver(self);
+        };
+
+        if (self.handle) |*h| {
+            self.resolve_fn = h.lookup(ResolveFn, "wren_lsp_resolve_module");
+            self.free_fn = h.lookup(FreeFn, "wren_lsp_free_result");
 
             if (self.resolve_fn == null) {
                 log.warn("Plugin missing wren_lsp_resolve_module symbol", .{});
@@ -297,10 +298,12 @@ pub const PluginResolver = struct {
             if (self.free_fn == null) {
                 log.warn("Plugin missing wren_lsp_free_result symbol", .{});
             }
-        } else {
-            log.warn("Failed to load plugin library: {s}", .{lib_path});
         }
 
+        return createResolver(self);
+    }
+
+    fn createResolver(self: *Self) Resolver {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -310,6 +313,33 @@ pub const PluginResolver = struct {
         };
     }
 
+    /// Resolve the library path, handling relative paths and platform extensions.
+    fn resolveLibraryPath(allocator: std.mem.Allocator, library: []const u8, project_root: ?[]const u8) ?[]const u8 {
+        // Resolve relative path against project root
+        const base_path = if (std.mem.startsWith(u8, library, "./"))
+            if (project_root) |pr|
+                std.fs.path.join(allocator, &.{ pr, library[2..] }) catch return null
+            else
+                allocator.dupe(u8, library) catch return null
+        else
+            allocator.dupe(u8, library) catch return null;
+
+        // Check if the path already has a recognized extension
+        if (hasLibraryExtension(base_path)) {
+            return base_path;
+        }
+
+        // Try appending platform-specific extension
+        defer allocator.free(base_path);
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, native_lib_ext }) catch null;
+    }
+
+    fn hasLibraryExtension(path: []const u8) bool {
+        return std.mem.endsWith(u8, path, ".dylib") or
+            std.mem.endsWith(u8, path, ".so") or
+            std.mem.endsWith(u8, path, ".dll");
+    }
+
     fn resolveImpl(ptr: *anyopaque, allocator: std.mem.Allocator, request: ResolveRequest) ?ResolveResult {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.doResolve(allocator, request);
@@ -317,8 +347,8 @@ pub const PluginResolver = struct {
 
     fn deinitImpl(ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.handle) |h| {
-            _ = std.c.dlclose(h);
+        if (self.handle) |*h| {
+            h.close();
         }
         allocator.destroy(self);
     }
