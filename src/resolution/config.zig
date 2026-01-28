@@ -226,6 +226,10 @@ fn mergeConfigs(parent: Config, child: Config) Config {
                 child.diagnostics.extension_in_import
             else
                 parent.diagnostics.extension_in_import,
+            .unknown_variable = if (child.diagnostics.unknown_variable != .@"error")
+                child.diagnostics.unknown_variable
+            else
+                parent.diagnostics.unknown_variable,
         },
         .arena = child.arena,
     };
@@ -287,6 +291,9 @@ fn parseDiagnosticsConfig(value: std.json.Value) types.DiagnosticsConfig {
     }
     if (obj.get("extensionInImport")) |v| {
         if (v == .string) diag.extension_in_import = types.DiagnosticSeverity.fromString(v.string);
+    }
+    if (obj.get("unknownVariable")) |v| {
+        if (v == .string) diag.unknown_variable = types.DiagnosticSeverity.fromString(v.string);
     }
 
     return diag;

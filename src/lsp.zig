@@ -888,6 +888,9 @@ pub const Handler = struct {
                         continue;
                     }
 
+                    var resolved_uri: ?[]const u8 = null;
+                    var import_found = false;
+
                     if (chain) |c| {
                         const request = ResolveRequest{
                             .importer_uri = uri,
@@ -901,10 +904,11 @@ pub const Handler = struct {
                             if (result.kind == .file and result.uri != null) {
                                 const resolved_path = uriToPath(result.uri.?);
                                 if (std.fs.cwd().access(resolved_path, .{ .mode = .read_only })) |_| {
-                                    continue;
+                                    import_found = true;
+                                    resolved_uri = result.uri;
                                 } else |_| {}
                             } else if (result.kind == .virtual) {
-                                continue;
+                                import_found = true;
                             }
                         }
                     } else {
@@ -922,19 +926,78 @@ pub const Handler = struct {
                         defer if (full_path.ptr != with_ext.ptr) self.gpa.free(full_path);
 
                         if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
-                            continue;
+                            import_found = true;
+                            resolved_uri = std.fmt.allocPrint(self.gpa, "file://{s}", .{full_path}) catch null;
                         } else |_| {}
                     }
 
-                    if (diag_config.missing_import != .none) {
-                        var buf: [256]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&buf, "Cannot find import '{s}'", .{raw_path}) catch "Cannot find import";
-                        self.reportImportDiagnostic(doc, path_token, msg, diag_config.missing_import);
+                    if (!import_found) {
+                        if (diag_config.missing_import != .none) {
+                            var buf: [256]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&buf, "Cannot find import '{s}'", .{raw_path}) catch "Cannot find import";
+                            self.reportImportDiagnostic(doc, path_token, msg, diag_config.missing_import);
+                        }
+                        continue;
+                    }
+
+                    // Validate imported variables exist in the target module
+                    if (diag_config.unknown_variable != .none) {
+                        if (resolved_uri) |target_uri| {
+                            self.checkImportedVariables(doc, import_stmt, target_uri, diag_config.unknown_variable);
+                        }
                     }
                 },
                 else => {},
             }
         }
+    }
+
+    fn checkImportedVariables(
+        self: *Handler,
+        doc: *Document,
+        import_stmt: wrenalyzer.Ast.ImportStmt,
+        target_uri: []const u8,
+        severity: DiagnosticSeverity,
+    ) void {
+        const variables = import_stmt.variables orelse return;
+
+        // Try to load the target module if not already loaded
+        if (self.files.get(target_uri) == null) {
+            self.loadImportedFile(target_uri) catch return;
+        }
+
+        const target_doc = self.files.get(target_uri) orelse return;
+        const target_module = target_doc.module;
+
+        for (variables) |maybe_var| {
+            const var_token = maybe_var orelse continue;
+            const var_name = var_token.name();
+
+            if (!self.symbolExistsInModule(target_module, var_name)) {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Module does not export '{s}'", .{var_name}) catch "Unknown export";
+                self.reportImportDiagnostic(doc, var_token, msg, severity);
+            }
+        }
+    }
+
+    fn symbolExistsInModule(_: *Handler, module: wrenalyzer.Ast.Module, symbol_name: []const u8) bool {
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) return true;
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) return true;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn reportImportDiagnostic(

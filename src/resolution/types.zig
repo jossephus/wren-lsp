@@ -75,6 +75,7 @@ pub const DiagnosticSeverity = enum {
 pub const DiagnosticsConfig = struct {
     missing_import: DiagnosticSeverity = .warning,
     extension_in_import: DiagnosticSeverity = .info,
+    unknown_variable: DiagnosticSeverity = .@"error",
 };
 
 /// Resolver type discriminator.

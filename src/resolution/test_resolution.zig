@@ -100,3 +100,45 @@ test "path resolver with delimiter converts dots to slashes" {
     // Will return null since file doesn't exist, but tests the conversion logic
     _ = path_resolver.resolve(arena, request);
 }
+
+test "parser finds both classes and top-level vars" {
+    const wrenalyzer = @import("wrenalyzer");
+    const src =
+        \\class MyClass {
+        \\  construct new() {}
+        \\}
+        \\
+        \\var myVar = 1
+        \\var anotherVar = Fn.new {}
+    ;
+
+    var doc = try wrenalyzer.Ast.initFromSource(std.testing.allocator, src, null);
+    defer doc.deinit(std.testing.allocator);
+
+    var class_count: usize = 0;
+    var var_count: usize = 0;
+    var class_names = std.ArrayList([]const u8).init(std.testing.allocator);
+    defer class_names.deinit();
+    var var_names = std.ArrayList([]const u8).init(std.testing.allocator);
+    defer var_names.deinit();
+
+    for (doc.module.statements) |stmt| {
+        switch (stmt) {
+            .ClassStmt => |cs| {
+                class_count += 1;
+                if (cs.name) |n| try class_names.append(n.name());
+            },
+            .VarStmt => |vs| {
+                var_count += 1;
+                if (vs.name) |n| try var_names.append(n.name());
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), class_count);
+    try std.testing.expectEqual(@as(usize, 2), var_count);
+    try std.testing.expectEqualStrings("MyClass", class_names.items[0]);
+    try std.testing.expectEqualStrings("myVar", var_names.items[0]);
+    try std.testing.expectEqualStrings("anotherVar", var_names.items[1]);
+}
