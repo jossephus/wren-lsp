@@ -15,6 +15,8 @@ pub const ResolveResult = struct {
     kind: ModuleKind = .file,
     /// Resolver-provided diagnostics.
     diagnostics: []const Diagnostic = &.{},
+    /// Resolver-provided completions.
+    completions: []const []const u8 = &.{},
 
     pub const ModuleKind = enum {
         file,
@@ -39,6 +41,8 @@ pub const ResolveResult = struct {
 pub const ResolveRequest = struct {
     /// URI of the file containing the import statement.
     importer_uri: []const u8,
+    /// Canonical module id of the importer.
+    importer_module_id: []const u8,
     /// The raw import string from the source.
     import_string: []const u8,
     /// Project root directory (where wren-lsp.json is located).
@@ -67,35 +71,20 @@ pub const DiagnosticSeverity = enum {
     }
 };
 
-/// Diagnostics configuration from imports.diagnostics.
+/// Diagnostics configuration.
 pub const DiagnosticsConfig = struct {
     missing_import: DiagnosticSeverity = .warning,
-    unknown_scheme: DiagnosticSeverity = .none,
     extension_in_import: DiagnosticSeverity = .info,
-};
-
-/// Workspace configuration.
-pub const WorkspaceConfig = struct {
-    roots: []const []const u8 = &.{},
-    library: []const []const u8 = &.{},
-    stubs: []const []const u8 = &.{},
-    exclude: []const []const u8 = &.{},
 };
 
 /// Resolver type discriminator.
 pub const ResolverKind = enum {
     path,
-    dotted,
-    scheme,
-    stubs,
     plugin,
 
     pub fn fromString(s: []const u8) ?ResolverKind {
         const map = std.StaticStringMap(ResolverKind).initComptime(.{
             .{ "path", .path },
-            .{ "dotted", .dotted },
-            .{ "scheme", .scheme },
-            .{ "stubs", .stubs },
             .{ "plugin", .plugin },
         });
         return map.get(s);
@@ -105,22 +94,7 @@ pub const ResolverKind = enum {
 /// Path resolver configuration.
 pub const PathResolverConfig = struct {
     roots: []const []const u8 = &.{},
-    extensions: []const []const u8 = &.{".wren"},
-    index_files: []const []const u8 = &.{},
-};
-
-/// Dotted resolver configuration.
-pub const DottedResolverConfig = struct {
-    delimiter: []const u8 = ".",
-    map_to: []const u8 = "/",
-    roots: []const []const u8 = &.{},
-    extensions: []const []const u8 = &.{".wren"},
-};
-
-/// Scheme resolver configuration.
-pub const SchemeResolverConfig = struct {
-    scheme: []const u8,
-    strip_prefix: []const u8,
+    delimiter: []const u8 = "/",
 };
 
 /// Plugin resolver configuration.
@@ -133,23 +107,20 @@ pub const PluginResolverConfig = struct {
 pub const ResolverConfig = struct {
     kind: ResolverKind,
     path: PathResolverConfig = .{},
-    dotted: DottedResolverConfig = .{},
-    scheme: SchemeResolverConfig = .{ .scheme = "", .strip_prefix = "" },
     plugin: PluginResolverConfig = .{ .library = "" },
-};
-
-/// Top-level imports configuration.
-pub const ImportsConfig = struct {
-    prefer_relative_from_importer: bool = true,
-    resolvers: []const ResolverConfig = &.{},
-    diagnostics: DiagnosticsConfig = .{},
 };
 
 /// Top-level wren-lsp.json configuration.
 pub const Config = struct {
     version: u32 = 1,
-    workspace: WorkspaceConfig = .{},
-    imports: ImportsConfig = .{},
+    /// Path to parent config to inherit from.
+    extends: ?[]const u8 = null,
+    /// Directories to index for Wren files.
+    modules: []const []const u8 = &.{},
+    /// Ordered list of resolvers.
+    resolvers: []const ResolverConfig = &.{},
+    /// Diagnostic severity settings.
+    diagnostics: DiagnosticsConfig = .{},
 
     /// Config file path for reference.
     config_path: ?[]const u8 = null,

@@ -14,6 +14,7 @@ const resolution = @import("resolution/root.zig");
 const ConfigLoader = resolution.ConfigLoader;
 const ResolverChain = resolution.ResolverChain;
 const ResolveRequest = resolution.ResolveRequest;
+const ResolveResult = resolution.ResolveResult;
 const DiagnosticSeverity = resolution.DiagnosticSeverity;
 
 pub const Language = enum {
@@ -287,7 +288,7 @@ pub const Handler = struct {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
         };
 
-        if (try getImportPathCompletions(arena, doc, params.position, params.textDocument.uri)) |items| {
+        if (try self.getImportPathCompletions(arena, doc, params.position, params.textDocument.uri)) |items| {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
         }
 
@@ -412,6 +413,7 @@ pub const Handler = struct {
     }
 
     fn getImportPathCompletions(
+        self: *Handler,
         arena: std.mem.Allocator,
         doc: Document,
         position: types.Position,
@@ -447,7 +449,45 @@ pub const Handler = struct {
         }
 
         const prefix = line_slice[quote_start..local_offset];
+        if (self.getResolverImportCompletions(arena, uri, prefix)) |items| {
+            return items;
+        }
         return try listImportCompletions(arena, uri, prefix);
+    }
+
+    fn getResolverImportCompletions(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        prefix: []const u8,
+    ) ?[]types.CompletionItem {
+        const config = self.getConfig(uri);
+        const project_root = config.project_root orelse ".";
+
+        const chain = self.getResolverChain(uri) catch return null;
+        const request = ResolveRequest{
+            .importer_uri = uri,
+            .importer_module_id = uri,
+            .import_string = prefix,
+            .project_root = project_root,
+            .module_bases = config.modules,
+        };
+
+        if (chain.resolve(request)) |result| {
+            if (result.completions.len == 0) return null;
+
+            var items = arena.alloc(types.CompletionItem, result.completions.len) catch return null;
+            for (result.completions, 0..) |completion, idx| {
+                items[idx] = .{
+                    .label = completion,
+                    .kind = .File,
+                    .insertText = completion,
+                };
+            }
+            return items;
+        }
+
+        return null;
     }
 
     fn listImportCompletions(
@@ -757,9 +797,10 @@ pub const Handler = struct {
 
         const request = ResolveRequest{
             .importer_uri = uri,
+            .importer_module_id = uri,
             .import_string = import_path,
             .project_root = project_root,
-            .module_bases = config.workspace.roots,
+            .module_bases = config.modules,
         };
 
         if (chain.resolve(request)) |result| {
@@ -819,7 +860,7 @@ pub const Handler = struct {
 
     fn checkImportPaths(self: *Handler, doc: *Document, uri: []const u8) !void {
         const config = self.getConfig(uri);
-        const diag_config = config.imports.diagnostics;
+        const diag_config = config.diagnostics;
         const project_root = config.project_root orelse ".";
 
         const chain = self.getResolverChain(uri) catch null;
@@ -842,31 +883,21 @@ pub const Handler = struct {
                         continue;
                     }
 
+                    // Skip scheme-prefixed imports (e.g., "http:", "hl:")
                     if (hasSchemePrefix(raw_path)) {
-                        if (diag_config.unknown_scheme != .none) {
-                            if (chain) |c| {
-                                const request = ResolveRequest{
-                                    .importer_uri = uri,
-                                    .import_string = raw_path,
-                                    .project_root = project_root,
-                                    .module_bases = config.workspace.roots,
-                                };
-                                if (c.resolve(request)) |_| {
-                                    continue;
-                                }
-                            }
-                        }
                         continue;
                     }
 
                     if (chain) |c| {
                         const request = ResolveRequest{
                             .importer_uri = uri,
+                            .importer_module_id = uri,
                             .import_string = raw_path,
                             .project_root = project_root,
-                            .module_bases = config.workspace.roots,
+                            .module_bases = config.modules,
                         };
                         if (c.resolve(request)) |result| {
+                            self.reportResolverDiagnostics(doc, path_token, result.diagnostics);
                             if (result.kind == .file and result.uri != null) {
                                 const resolved_path = uriToPath(result.uri.?);
                                 if (std.fs.cwd().access(resolved_path, .{ .mode = .read_only })) |_| {
@@ -918,6 +949,23 @@ pub const Handler = struct {
             .warning => doc.reporter.reportWarning(token, message),
             .info, .hint => doc.reporter.reportInfo(token, message),
             .none => {},
+        }
+    }
+
+    fn reportResolverDiagnostics(
+        self: *Handler,
+        doc: *Document,
+        token: Token,
+        diagnostics: []const ResolveResult.Diagnostic,
+    ) void {
+        for (diagnostics) |diag| {
+            const severity = switch (diag.severity) {
+                .@"error" => DiagnosticSeverity.@"error",
+                .warning => DiagnosticSeverity.warning,
+                .info => DiagnosticSeverity.info,
+                .hint => DiagnosticSeverity.hint,
+            };
+            self.reportImportDiagnostic(doc, token, diag.message, severity);
         }
     }
 

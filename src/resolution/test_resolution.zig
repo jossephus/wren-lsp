@@ -9,7 +9,7 @@ const ConfigLoader = config.ConfigLoader;
 const ResolverChain = resolver.ResolverChain;
 const ResolveRequest = types.ResolveRequest;
 
-test "config loader parses test project config" {
+test "config loader parses simplified config" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -19,26 +19,20 @@ test "config loader parses test project config" {
     const json =
         \\{
         \\  "version": 1,
-        \\  "workspace": {
-        \\    "roots": ["./src", "./modules"],
-        \\    "stubs": ["./stubs/wren-cli"]
-        \\  },
-        \\  "imports": {
-        \\    "resolvers": [
-        \\      {"type": "path", "roots": ["./src", "./modules"], "extensions": [".wren"]},
-        \\      {"type": "stubs"}
-        \\    ]
-        \\  }
+        \\  "modules": ["./src", "./modules"],
+        \\  "resolvers": [
+        \\    {"type": "path", "roots": ["./src", "./modules"], "delimiter": "."}
+        \\  ]
         \\}
     ;
 
     const cfg = try loader.parseJson(json);
 
-    try std.testing.expectEqual(@as(usize, 2), cfg.workspace.roots.len);
-    try std.testing.expectEqualStrings("./src", cfg.workspace.roots[0]);
-    try std.testing.expectEqualStrings("./modules", cfg.workspace.roots[1]);
-    try std.testing.expectEqual(@as(usize, 1), cfg.workspace.stubs.len);
-    try std.testing.expectEqual(@as(usize, 2), cfg.imports.resolvers.len);
+    try std.testing.expectEqual(@as(usize, 2), cfg.modules.len);
+    try std.testing.expectEqualStrings("./src", cfg.modules[0]);
+    try std.testing.expectEqualStrings("./modules", cfg.modules[1]);
+    try std.testing.expectEqual(@as(usize, 1), cfg.resolvers.len);
+    try std.testing.expectEqualStrings(".", cfg.resolvers[0].path.delimiter);
 }
 
 test "path resolver resolves relative imports" {
@@ -48,12 +42,12 @@ test "path resolver resolves relative imports" {
 
     const path_resolver = try resolver.PathResolver.create(arena, .{
         .roots = &.{},
-        .extensions = &.{".wren"},
-        .index_files = &.{},
+        .delimiter = "/",
     }, null);
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
+        .importer_module_id = "file:///tmp/test/src/main.wren",
         .import_string = "./utils",
         .project_root = "/tmp/test",
     };
@@ -61,39 +55,13 @@ test "path resolver resolves relative imports" {
     _ = path_resolver.resolve(arena, request);
 }
 
-test "stubs resolver returns virtual module" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const stubs_resolver = try resolver.StubsResolver.create(arena, &.{"./stubs/wren-cli"});
-
-    const request = ResolveRequest{
-        .importer_uri = "file:///tmp/test/src/main.wren",
-        .import_string = "io",
-        .project_root = "/tmp/test",
-    };
-
-    const result = stubs_resolver.resolve(arena, request);
-    if (result) |r| {
-        try std.testing.expect(r.kind == .file or r.kind == .virtual);
-    }
-}
-
-test "resolver chain uses first match" {
+test "resolver chain uses default path resolver" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const cfg = types.Config{
-        .workspace = .{
-            .stubs = &.{"./stubs/wren-cli"},
-        },
-        .imports = .{
-            .resolvers = &.{
-                .{ .kind = .stubs },
-            },
-        },
+        .modules = &.{"./src"},
         .project_root = "/tmp/test",
     };
 
@@ -101,53 +69,34 @@ test "resolver chain uses first match" {
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
-        .import_string = "io",
+        .importer_module_id = "file:///tmp/test/src/main.wren",
+        .import_string = "utils",
         .project_root = "/tmp/test",
     };
 
+    // Will return virtual fallback for non-existent module
     const result = chain.resolve(request);
     try std.testing.expect(result != null);
+    try std.testing.expect(result.?.kind == .virtual);
 }
 
-test "dotted resolver converts dots to slashes" {
+test "path resolver with delimiter converts dots to slashes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const dotted_resolver = try resolver.DottedResolver.create(arena, .{
-        .delimiter = ".",
-        .map_to = "/",
+    const path_resolver = try resolver.PathResolver.create(arena, .{
         .roots = &.{"./src"},
-        .extensions = &.{".wren"},
+        .delimiter = ".",
     }, "/tmp/test");
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
+        .importer_module_id = "file:///tmp/test/src/main.wren",
         .import_string = "models.user",
         .project_root = "/tmp/test",
     };
 
-    _ = dotted_resolver.resolve(arena, request);
-}
-
-test "scheme resolver strips prefix" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const scheme_resolver = try resolver.SchemeResolver.create(arena, .{
-        .scheme = "hl",
-        .strip_prefix = "hl:",
-    }, "/tmp/test");
-
-    const request = ResolveRequest{
-        .importer_uri = "file:///tmp/test/src/main.wren",
-        .import_string = "hl:graphics/sprite",
-        .project_root = "/tmp/test",
-    };
-
-    const result = scheme_resolver.resolve(arena, request);
-    if (result) |r| {
-        try std.testing.expect(std.mem.indexOf(u8, r.canonical_id, "wren://hl/") != null);
-    }
+    // Will return null since file doesn't exist, but tests the conversion logic
+    _ = path_resolver.resolve(arena, request);
 }

@@ -14,6 +14,7 @@ pub const log = std.log.scoped(.wren_lsp_config);
 pub const ConfigLoader = struct {
     allocator: std.mem.Allocator,
     cache: std.StringHashMapUnmanaged(Config) = .empty,
+    loading: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ConfigLoader {
         return .{ .allocator = allocator };
@@ -26,9 +27,9 @@ pub const ConfigLoader = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.cache.deinit(self.allocator);
+        self.loading.deinit(self.allocator);
     }
 
-    /// Load config for the given file URI. Searches upward for wren-lsp.json.
     pub fn loadForFile(self: *ConfigLoader, file_uri: []const u8) !Config {
         const file_path = uriToPath(file_uri);
         const dir = std.fs.path.dirname(file_path) orelse file_path;
@@ -40,7 +41,7 @@ pub const ConfigLoader = struct {
                 return cached;
             }
 
-            var config = try self.parseConfigFile(config_path);
+            var config = try self.loadConfigWithExtends(config_path);
             config.config_path = config_path;
             config.project_root = project_root;
 
@@ -52,7 +53,91 @@ pub const ConfigLoader = struct {
         return Config{};
     }
 
-    /// Search upward from start_dir for wren-lsp.json.
+    fn loadConfigWithExtends(self: *ConfigLoader, config_path: []const u8) !Config {
+        if (self.loading.contains(config_path)) {
+            log.warn("Circular extends detected: {s}", .{config_path});
+            return Config{};
+        }
+
+        try self.loading.put(self.allocator, config_path, {});
+        defer _ = self.loading.remove(config_path);
+
+        var config = try self.parseConfigFile(config_path);
+        const config_dir = std.fs.path.dirname(config_path) orelse ".";
+
+        if (config.extends) |extends_path| {
+            const parent_path = try self.resolveExtendsPath(config_dir, extends_path);
+
+            if (parent_path) |pp| {
+                const parent_dir = std.fs.path.dirname(pp) orelse ".";
+                var parent_config = try self.loadConfigWithExtends(pp);
+                try self.normalizePaths(&parent_config, parent_dir);
+                config = mergeConfigs(parent_config, config);
+            }
+        }
+
+        return config;
+    }
+
+    fn normalizePaths(self: *ConfigLoader, config: *Config, base_dir: []const u8) !void {
+        const arena = if (config.arena) |a| a.allocator() else self.allocator;
+
+        if (config.modules.len > 0) {
+            var norm_modules = try std.ArrayListUnmanaged([]const u8).initCapacity(arena, config.modules.len);
+            for (config.modules) |mod| {
+                const norm_path = try joinAndNormalize(arena, base_dir, mod);
+                try norm_modules.append(arena, norm_path);
+            }
+            config.modules = try norm_modules.toOwnedSlice(arena);
+        }
+
+        if (config.resolvers.len > 0) {
+            var norm_resolvers = try arena.alloc(types.ResolverConfig, config.resolvers.len);
+            for (config.resolvers, 0..) |resolver, i| {
+                norm_resolvers[i] = resolver;
+                if (resolver.kind == .path and resolver.path.roots.len > 0) {
+                    var norm_roots = try std.ArrayListUnmanaged([]const u8).initCapacity(arena, resolver.path.roots.len);
+                    for (resolver.path.roots) |root| {
+                        const norm_path = try joinAndNormalize(arena, base_dir, root);
+                        try norm_roots.append(arena, norm_path);
+                    }
+                    norm_resolvers[i].path.roots = try norm_roots.toOwnedSlice(arena);
+                } else if (resolver.kind == .plugin and resolver.plugin.library.len > 0) {
+                    norm_resolvers[i].plugin.library = try joinAndNormalize(arena, base_dir, resolver.plugin.library);
+                }
+            }
+            config.resolvers = norm_resolvers;
+        }
+    }
+
+    fn resolveExtendsPath(self: *ConfigLoader, base_dir: []const u8, extends: []const u8) !?[]const u8 {
+        const resolved = if (std.mem.startsWith(u8, extends, "./") or std.mem.startsWith(u8, extends, "../"))
+            try std.fs.path.join(self.allocator, &.{ base_dir, extends })
+        else if (std.fs.path.isAbsolute(extends))
+            try self.allocator.dupe(u8, extends)
+        else
+            try std.fs.path.join(self.allocator, &.{ base_dir, extends });
+
+        if (std.mem.endsWith(u8, resolved, ".json")) {
+            if (std.fs.cwd().access(resolved, .{ .mode = .read_only })) |_| {
+                return resolved;
+            } else |_| {
+                self.allocator.free(resolved);
+                return null;
+            }
+        }
+
+        const dir_config = try std.fs.path.join(self.allocator, &.{ resolved, "wren-lsp.json" });
+        self.allocator.free(resolved);
+
+        if (std.fs.cwd().access(dir_config, .{ .mode = .read_only })) |_| {
+            return dir_config;
+        } else |_| {
+            self.allocator.free(dir_config);
+            return null;
+        }
+    }
+
     fn findConfigFile(self: *ConfigLoader, start_dir: []const u8) !?[]const u8 {
         var current = start_dir;
 
@@ -74,7 +159,6 @@ pub const ConfigLoader = struct {
         return null;
     }
 
-    /// Parse wren-lsp.json file.
     fn parseConfigFile(self: *ConfigLoader, path: []const u8) !Config {
         const contents = std.fs.cwd().readFileAlloc(self.allocator, path, 1024 * 1024) catch |err| {
             log.warn("Failed to read config file {s}: {}", .{ path, err });
@@ -85,7 +169,6 @@ pub const ConfigLoader = struct {
         return self.parseJson(contents);
     }
 
-    /// Parse JSON config content.
     pub fn parseJson(self: *ConfigLoader, json_str: []const u8) !Config {
         const arena_ptr = try self.allocator.create(std.heap.ArenaAllocator);
         arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
@@ -98,7 +181,6 @@ pub const ConfigLoader = struct {
             log.warn("Failed to parse config JSON: {}", .{err});
             return config;
         };
-        // No defer deinit - parsed data lives in arena
 
         const root = parsed.value;
         if (root != .object) return config;
@@ -109,148 +191,113 @@ pub const ConfigLoader = struct {
             if (v == .integer) config.version = @intCast(v.integer);
         }
 
-        if (obj.get("workspace")) |ws| {
-            config.workspace = try self.parseWorkspaceWithArena(ws, arena);
+        if (obj.get("extends")) |v| {
+            if (v == .string) config.extends = try arena.dupe(u8, v.string);
         }
 
-        if (obj.get("imports")) |imp| {
-            config.imports = try self.parseImportsWithArena(imp, arena);
+        if (obj.get("modules")) |v| {
+            config.modules = try parseStringArrayAlloc(v, arena);
         }
 
-        return config;
-    }
-
-    fn parseWorkspaceWithArena(_: *ConfigLoader, value: std.json.Value, arena: std.mem.Allocator) !types.WorkspaceConfig {
-        var ws = types.WorkspaceConfig{};
-        if (value != .object) return ws;
-
-        const obj = value.object;
-
-        ws.roots = try parseStringArrayAlloc(obj.get("roots"), arena);
-        ws.library = try parseStringArrayAlloc(obj.get("library"), arena);
-        ws.stubs = try parseStringArrayAlloc(obj.get("stubs"), arena);
-        ws.exclude = try parseStringArrayAlloc(obj.get("exclude"), arena);
-
-        return ws;
-    }
-
-    fn parseImportsWithArena(_: *ConfigLoader, value: std.json.Value, arena: std.mem.Allocator) !types.ImportsConfig {
-        var imp = types.ImportsConfig{};
-        if (value != .object) return imp;
-
-        const obj = value.object;
-
-        if (obj.get("preferRelativeFromImporter")) |v| {
-            if (v == .bool) imp.prefer_relative_from_importer = v.bool;
+        if (obj.get("resolvers")) |v| {
+            config.resolvers = try parseResolversAlloc(v, arena);
         }
 
-        if (obj.get("resolvers")) |resolvers_val| {
-            imp.resolvers = try parseResolversAlloc(resolvers_val, arena);
-        }
-
-        if (obj.get("diagnostics")) |diag| {
-            imp.diagnostics = parseDiagnosticsConfigPure(diag);
-        }
-
-        return imp;
-    }
-
-    fn parseResolversAlloc(value: std.json.Value, arena: std.mem.Allocator) ![]const ResolverConfig {
-        if (value != .array) return &.{};
-
-        var resolvers: std.ArrayListUnmanaged(ResolverConfig) = .empty;
-
-        for (value.array.items) |item| {
-            if (try parseResolverAlloc(item, arena)) |resolver| {
-                try resolvers.append(arena, resolver);
-            }
-        }
-
-        return resolvers.toOwnedSlice(arena);
-    }
-
-    fn parseResolverAlloc(value: std.json.Value, arena: std.mem.Allocator) !?ResolverConfig {
-        if (value != .object) return null;
-
-        const obj = value.object;
-        const type_str = obj.get("type") orelse return null;
-        if (type_str != .string) return null;
-
-        const kind = ResolverKind.fromString(type_str.string) orelse return null;
-
-        var config = ResolverConfig{ .kind = kind };
-
-        switch (kind) {
-            .path => {
-                config.path.roots = try parseStringArrayAlloc(obj.get("roots"), arena);
-                config.path.extensions = try parseStringArrayAlloc(obj.get("extensions"), arena);
-                config.path.index_files = try parseStringArrayAlloc(obj.get("indexFiles"), arena);
-                if (config.path.extensions.len == 0) {
-                    config.path.extensions = try dupeStringArrayAlloc(&.{".wren"}, arena);
-                }
-            },
-            .dotted => {
-                if (obj.get("delimiter")) |v| {
-                    if (v == .string) config.dotted.delimiter = try arena.dupe(u8, v.string);
-                }
-                if (obj.get("mapTo")) |v| {
-                    if (v == .string) config.dotted.map_to = try arena.dupe(u8, v.string);
-                }
-                config.dotted.roots = try parseStringArrayAlloc(obj.get("roots"), arena);
-                config.dotted.extensions = try parseStringArrayAlloc(obj.get("extensions"), arena);
-                if (config.dotted.extensions.len == 0) {
-                    config.dotted.extensions = try dupeStringArrayAlloc(&.{".wren"}, arena);
-                }
-            },
-            .scheme => {
-                if (obj.get("scheme")) |v| {
-                    if (v == .string) config.scheme.scheme = try arena.dupe(u8, v.string);
-                }
-                if (obj.get("stripPrefix")) |v| {
-                    if (v == .string) config.scheme.strip_prefix = try arena.dupe(u8, v.string);
-                }
-            },
-            .plugin => {
-                if (obj.get("library")) |v| {
-                    if (v == .string) config.plugin.library = try arena.dupe(u8, v.string);
-                }
-                if (obj.get("fallbackToBuiltin")) |v| {
-                    if (v == .bool) config.plugin.fallback_to_builtin = v.bool;
-                }
-            },
-            .stubs => {},
+        if (obj.get("diagnostics")) |v| {
+            config.diagnostics = parseDiagnosticsConfig(v);
         }
 
         return config;
-    }
-
-    fn parseDiagnosticsConfigPure(value: std.json.Value) types.DiagnosticsConfig {
-        var diag = types.DiagnosticsConfig{};
-        if (value != .object) return diag;
-
-        const obj = value.object;
-
-        if (obj.get("missingImport")) |v| {
-            if (v == .string) diag.missing_import = types.DiagnosticSeverity.fromString(v.string);
-        }
-        if (obj.get("unknownScheme")) |v| {
-            if (v == .string) diag.unknown_scheme = types.DiagnosticSeverity.fromString(v.string);
-        }
-        if (obj.get("extensionInImport")) |v| {
-            if (v == .string) diag.extension_in_import = types.DiagnosticSeverity.fromString(v.string);
-        }
-
-        return diag;
     }
 };
 
-fn parseStringArrayAlloc(value: ?std.json.Value, arena: std.mem.Allocator) ![]const []const u8 {
-    const val = value orelse return &.{};
-    if (val != .array) return &.{};
+fn mergeConfigs(parent: Config, child: Config) Config {
+    return Config{
+        .version = child.version,
+        .extends = null,
+        .modules = if (child.modules.len > 0) child.modules else parent.modules,
+        .resolvers = if (child.resolvers.len > 0) child.resolvers else parent.resolvers,
+        .diagnostics = .{
+            .missing_import = if (child.diagnostics.missing_import != .warning)
+                child.diagnostics.missing_import
+            else
+                parent.diagnostics.missing_import,
+            .extension_in_import = if (child.diagnostics.extension_in_import != .info)
+                child.diagnostics.extension_in_import
+            else
+                parent.diagnostics.extension_in_import,
+        },
+        .arena = child.arena,
+    };
+}
+
+fn parseResolversAlloc(value: std.json.Value, arena: std.mem.Allocator) ![]const ResolverConfig {
+    if (value != .array) return &.{};
+
+    var resolvers: std.ArrayListUnmanaged(ResolverConfig) = .empty;
+
+    for (value.array.items) |item| {
+        if (try parseResolverAlloc(item, arena)) |resolver| {
+            try resolvers.append(arena, resolver);
+        }
+    }
+
+    return resolvers.toOwnedSlice(arena);
+}
+
+fn parseResolverAlloc(value: std.json.Value, arena: std.mem.Allocator) !?ResolverConfig {
+    if (value != .object) return null;
+
+    const obj = value.object;
+    const type_str = obj.get("type") orelse return null;
+    if (type_str != .string) return null;
+
+    const kind = ResolverKind.fromString(type_str.string) orelse return null;
+
+    var config = ResolverConfig{ .kind = kind };
+
+    switch (kind) {
+        .path => {
+            config.path.roots = try parseStringArrayAlloc(obj.get("roots") orelse .null, arena);
+            if (obj.get("delimiter")) |v| {
+                if (v == .string) config.path.delimiter = try arena.dupe(u8, v.string);
+            }
+        },
+        .plugin => {
+            if (obj.get("library")) |v| {
+                if (v == .string) config.plugin.library = try arena.dupe(u8, v.string);
+            }
+            if (obj.get("fallbackToBuiltin")) |v| {
+                if (v == .bool) config.plugin.fallback_to_builtin = v.bool;
+            }
+        },
+    }
+
+    return config;
+}
+
+fn parseDiagnosticsConfig(value: std.json.Value) types.DiagnosticsConfig {
+    var diag = types.DiagnosticsConfig{};
+    if (value != .object) return diag;
+
+    const obj = value.object;
+
+    if (obj.get("missingImport")) |v| {
+        if (v == .string) diag.missing_import = types.DiagnosticSeverity.fromString(v.string);
+    }
+    if (obj.get("extensionInImport")) |v| {
+        if (v == .string) diag.extension_in_import = types.DiagnosticSeverity.fromString(v.string);
+    }
+
+    return diag;
+}
+
+fn parseStringArrayAlloc(value: std.json.Value, arena: std.mem.Allocator) ![]const []const u8 {
+    if (value != .array) return &.{};
 
     var strings: std.ArrayListUnmanaged([]const u8) = .empty;
 
-    for (val.array.items) |item| {
+    for (value.array.items) |item| {
         if (item == .string) {
             try strings.append(arena, try arena.dupe(u8, item.string));
         }
@@ -259,12 +306,71 @@ fn parseStringArrayAlloc(value: ?std.json.Value, arena: std.mem.Allocator) ![]co
     return strings.toOwnedSlice(arena);
 }
 
-fn dupeStringArrayAlloc(src: []const []const u8, arena: std.mem.Allocator) ![]const []const u8 {
-    const result = try arena.alloc([]const u8, src.len);
-    for (src, 0..) |s, i| {
-        result[i] = try arena.dupe(u8, s);
+/// Join base_dir with path and normalize, preserving path semantics.
+fn joinAndNormalize(arena: std.mem.Allocator, base_dir: []const u8, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try normalizePath(arena, path);
     }
-    return result;
+
+    const joined = try std.fs.path.join(arena, &.{ base_dir, path });
+    defer arena.free(joined);
+    return try normalizePath(arena, joined);
+}
+
+/// Normalize a path by resolving "." and ".." components.
+/// Preserves leading "./" for relative imports and absolute prefixes.
+fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (path.len == 0) return try allocator.dupe(u8, ".");
+
+    var components = std.ArrayListUnmanaged([]const u8){};
+    defer components.deinit(allocator);
+
+    var leading_doubles: usize = 0;
+    const is_absolute = std.fs.path.isAbsolute(path);
+    const has_leading_dot_slash = std.mem.startsWith(u8, path, "./");
+
+    var iter = std.mem.splitAny(u8, path, "/\\");
+    while (iter.next()) |component| {
+        if (component.len == 0) continue;
+
+        if (std.mem.eql(u8, component, ".")) {
+            continue;
+        } else if (std.mem.eql(u8, component, "..")) {
+            if (components.items.len > 0) {
+                _ = components.pop();
+            } else if (!is_absolute) {
+                leading_doubles += 1;
+            }
+        } else {
+            try components.append(allocator, component);
+        }
+    }
+
+    var result = std.ArrayListUnmanaged(u8){};
+    errdefer result.deinit(allocator);
+
+    if (is_absolute) {
+        try result.append(allocator, '/');
+    } else if (leading_doubles > 0) {
+        for (0..leading_doubles) |i| {
+            if (i > 0) try result.append(allocator, '/');
+            try result.appendSlice(allocator, "..");
+        }
+        if (components.items.len > 0) try result.append(allocator, '/');
+    } else if (has_leading_dot_slash) {
+        try result.appendSlice(allocator, "./");
+    }
+
+    for (components.items, 0..) |component, i| {
+        if (i > 0) try result.append(allocator, '/');
+        try result.appendSlice(allocator, component);
+    }
+
+    if (result.items.len == 0) {
+        try result.append(allocator, '.');
+    }
+
+    return try result.toOwnedSlice(allocator);
 }
 
 pub fn freeConfig(backing_allocator: std.mem.Allocator, cfg: *Config) void {
@@ -283,7 +389,9 @@ test "parse empty config" {
     var loader = ConfigLoader.init(std.testing.allocator);
     defer loader.deinit();
 
-    const config = try loader.parseJson("{}");
+    var config = try loader.parseJson("{}");
+    defer config.deinit(std.testing.allocator);
+
     try std.testing.expectEqual(@as(u32, 1), config.version);
 }
 
@@ -297,19 +405,13 @@ test "parse full config" {
     const json =
         \\{
         \\  "version": 1,
-        \\  "workspace": {
-        \\    "roots": ["./src"],
-        \\    "stubs": ["builtin:wren-cli"]
-        \\  },
-        \\  "imports": {
-        \\    "preferRelativeFromImporter": true,
-        \\    "resolvers": [
-        \\      {"type": "path", "roots": ["./src"], "extensions": [".wren"]},
-        \\      {"type": "stubs"}
-        \\    ],
-        \\    "diagnostics": {
-        \\      "missingImport": "error"
-        \\    }
+        \\  "modules": ["./src", "./deps"],
+        \\  "resolvers": [
+        \\    {"type": "path", "roots": ["./src"], "delimiter": "."},
+        \\    {"type": "plugin", "library": "./resolver.dylib", "fallbackToBuiltin": true}
+        \\  ],
+        \\  "diagnostics": {
+        \\    "missingImport": "error"
         \\  }
         \\}
     ;
@@ -317,7 +419,44 @@ test "parse full config" {
     const cfg = try loader.parseJson(json);
 
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
-    try std.testing.expectEqual(@as(usize, 1), cfg.workspace.roots.len);
-    try std.testing.expectEqual(@as(usize, 2), cfg.imports.resolvers.len);
-    try std.testing.expectEqual(types.DiagnosticSeverity.@"error", cfg.imports.diagnostics.missing_import);
+    try std.testing.expectEqual(@as(usize, 2), cfg.modules.len);
+    try std.testing.expectEqual(@as(usize, 2), cfg.resolvers.len);
+    try std.testing.expectEqualStrings(".", cfg.resolvers[0].path.delimiter);
+    try std.testing.expectEqual(types.DiagnosticSeverity.@"error", cfg.diagnostics.missing_import);
+}
+
+test "parse config with extends" {
+    var loader = ConfigLoader.init(std.testing.allocator);
+    defer loader.deinit();
+
+    const json =
+        \\{
+        \\  "extends": "./base/wren-lsp.json",
+        \\  "modules": ["./src"]
+        \\}
+    ;
+
+    var cfg = try loader.parseJson(json);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("./base/wren-lsp.json", cfg.extends.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.modules.len);
+}
+
+test "normalizePath handles dot components" {
+    const result = try normalizePath(std.testing.allocator, "./foo/bar/../baz");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("./foo/baz", result);
+}
+
+test "normalizePath preserves leading dot-slash" {
+    const result = try normalizePath(std.testing.allocator, "./src/lib");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("./src/lib", result);
+}
+
+test "normalizePath handles parent refs" {
+    const result = try normalizePath(std.testing.allocator, "../project/modules");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("../project/modules", result);
 }
