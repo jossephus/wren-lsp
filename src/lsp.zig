@@ -909,6 +909,11 @@ pub const Handler = struct {
                                 } else |_| {}
                             } else if (result.kind == .virtual) {
                                 import_found = true;
+                                // For virtual modules with source, load and validate
+                                if (result.source) |source| {
+                                    self.loadVirtualModule(result.canonical_id, source) catch {};
+                                    resolved_uri = self.gpa.dupe(u8, result.canonical_id) catch null;
+                                }
                             }
                         }
                     } else {
@@ -1058,13 +1063,22 @@ pub const Handler = struct {
         const contents = try std.fs.cwd().readFileAlloc(self.gpa, file_path, 10 * 1024 * 1024);
         defer self.gpa.free(contents);
 
+        try self.loadModuleSource(uri, contents);
+    }
+
+    /// Load a virtual module from inline source content.
+    fn loadVirtualModule(self: *Handler, canonical_id: []const u8, source: []const u8) !void {
+        try self.loadModuleSource(canonical_id, source);
+    }
+
+    /// Common logic for loading a module from source content.
+    fn loadModuleSource(self: *Handler, uri: []const u8, contents: []const u8) !void {
         const new_text = try self.gpa.alloc(u8, contents.len + 1);
         @memcpy(new_text[0..contents.len], contents);
         new_text[contents.len] = 0;
 
         const new_text_z: [:0]const u8 = new_text[0..contents.len :0];
-        var doc = try Document.init(self.gpa, new_text_z, .wren);
-        try self.checkImportPaths(&doc, uri);
+        const doc = try Document.init(self.gpa, new_text_z, .wren);
 
         const gop = try self.files.getOrPut(self.gpa, uri);
         errdefer _ = self.files.remove(uri);

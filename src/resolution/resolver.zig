@@ -397,6 +397,10 @@ pub const PluginResolver = struct {
             result.uri = allocator.dupe(u8, std.mem.span(uri)) catch null;
         }
 
+        if (response.source) |source| {
+            result.source = allocator.dupe(u8, std.mem.span(source)) catch null;
+        }
+
         if (response.kind) |kind| {
             const kind_str = std.mem.span(kind);
             if (std.mem.eql(u8, kind_str, "file")) {
@@ -440,6 +444,7 @@ const WrenLspDiagnostic = extern struct {
 const WrenLspResolveResult = extern struct {
     canonical_id: ?[*:0]const u8,
     uri: ?[*:0]const u8,
+    source: ?[*:0]const u8,
     kind: ?[*:0]const u8,
     diagnostics: ?[*]const WrenLspDiagnostic,
     diagnostics_len: usize,

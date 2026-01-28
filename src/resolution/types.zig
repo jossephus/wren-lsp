@@ -11,6 +11,8 @@ pub const ResolveResult = struct {
     canonical_id: []const u8,
     /// File path if the module is file-backed, null for virtual modules.
     uri: ?[]const u8 = null,
+    /// Module source content. If provided, used directly instead of reading from URI.
+    source: ?[]const u8 = null,
     /// Module kind for diagnostics policy.
     kind: ModuleKind = .file,
     /// Resolver-provided diagnostics.
