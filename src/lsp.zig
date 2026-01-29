@@ -288,6 +288,10 @@ pub const Handler = struct {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = &.{} } };
         };
 
+        if (try self.getImportSymbolCompletions(arena, doc, params.position, params.textDocument.uri)) |items| {
+            return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
+        }
+
         if (try self.getImportPathCompletions(arena, doc, params.position, params.textDocument.uri)) |items| {
             return .{ .CompletionList = .{ .isIncomplete = false, .items = items } };
         }
@@ -452,7 +456,7 @@ pub const Handler = struct {
         if (self.getResolverImportCompletions(arena, uri, prefix)) |items| {
             return items;
         }
-        return try listImportCompletions(arena, uri, prefix);
+        return try self.listImportCompletions(arena, uri, prefix);
     }
 
     fn getResolverImportCompletions(
@@ -491,41 +495,196 @@ pub const Handler = struct {
     }
 
     fn listImportCompletions(
+        self: *Handler,
         arena: std.mem.Allocator,
         uri: []const u8,
         prefix: []const u8,
     ) !?[]types.CompletionItem {
-        const base_path = uriToPath(uri);
-        const base_dir = std.fs.path.dirname(base_path) orelse base_path;
-
-        var dir = try std.fs.cwd().openDir(base_dir, .{ .iterate = true });
-        defer dir.close();
-
-        var walker = try dir.walk(arena);
-        defer walker.deinit();
+        const config = self.getConfig(uri);
+        const project_root = config.project_root orelse ".";
 
         const trimmed_prefix = if (std.mem.startsWith(u8, prefix, "./")) prefix[2..] else prefix;
         const needs_dot = std.mem.startsWith(u8, prefix, "./");
 
         var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
 
-        while (try walker.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.path, ".wren")) continue;
-
-            const path_no_ext = entry.path[0 .. entry.path.len - 5];
-            if (trimmed_prefix.len > 0 and !std.mem.startsWith(u8, path_no_ext, trimmed_prefix)) continue;
-
-            const insert_text = if (needs_dot)
-                try std.fmt.allocPrint(arena, "./{s}", .{path_no_ext})
+        // Scan configured module directories
+        for (config.modules) |mod_path| {
+            const resolved_path = if (std.mem.startsWith(u8, mod_path, "./"))
+                try std.fs.path.join(arena, &.{ project_root, mod_path[2..] })
+            else if (!std.fs.path.isAbsolute(mod_path))
+                try std.fs.path.join(arena, &.{ project_root, mod_path })
             else
-                try arena.dupe(u8, path_no_ext);
+                mod_path;
 
-            try items.append(arena, .{
-                .label = insert_text,
-                .kind = .File,
-                .insertText = insert_text,
-            });
+            var dir = std.fs.cwd().openDir(resolved_path, .{ .iterate = true }) catch continue;
+            defer dir.close();
+
+            var walker = try dir.walk(arena);
+            defer walker.deinit();
+
+            while (try walker.next()) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, ".wren")) continue;
+
+                const path_no_ext = entry.path[0 .. entry.path.len - 5];
+                if (trimmed_prefix.len > 0 and !std.mem.startsWith(u8, path_no_ext, trimmed_prefix)) continue;
+
+                try items.append(arena, .{
+                    .label = try arena.dupe(u8, path_no_ext),
+                    .kind = .File,
+                    .insertText = try arena.dupe(u8, path_no_ext),
+                });
+            }
+        }
+
+        // Also scan current file's directory for relative imports
+        const base_path = uriToPath(uri);
+        const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+
+        if (std.fs.cwd().openDir(base_dir, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close();
+
+            var walker = try dir.walk(arena);
+            defer walker.deinit();
+
+            while (try walker.next()) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, ".wren")) continue;
+
+                const path_no_ext = entry.path[0 .. entry.path.len - 5];
+                if (trimmed_prefix.len > 0 and !std.mem.startsWith(u8, path_no_ext, trimmed_prefix)) continue;
+
+                const insert_text = if (needs_dot)
+                    try std.fmt.allocPrint(arena, "./{s}", .{path_no_ext})
+                else
+                    try arena.dupe(u8, path_no_ext);
+
+                try items.append(arena, .{
+                    .label = insert_text,
+                    .kind = .File,
+                    .insertText = insert_text,
+                });
+            }
+        } else |_| {}
+
+        if (items.items.len == 0) return null;
+        return items.items;
+    }
+
+    fn getImportSymbolCompletions(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        position: types.Position,
+        uri: []const u8,
+    ) !?[]types.CompletionItem {
+        const offset = doc.positionToOffset(position.line, position.character) orelse return null;
+        if (offset > doc.src.len) return null;
+
+        const lines = doc.source_file.lines;
+        const line_index: usize = @intCast(position.line);
+        if (line_index >= lines.len) return null;
+
+        const line_start = lines[line_index];
+        const line_end = if (line_index + 1 < lines.len) lines[line_index + 1] else doc.src.len;
+        if (offset < line_start or offset > line_end) return null;
+
+        const line_slice = doc.src[line_start..line_end];
+        const local_offset = offset - line_start;
+
+        const import_index = std.mem.indexOf(u8, line_slice, "import") orelse return null;
+        var i = import_index + "import".len;
+        while (i < line_slice.len and std.ascii.isWhitespace(line_slice[i])) : (i += 1) {}
+        if (i >= line_slice.len) return null;
+
+        const quote = line_slice[i];
+        if (quote != '"' and quote != '\'') return null;
+        const quote_start = i + 1;
+        const close_index = std.mem.indexOfScalarPos(u8, line_slice, quote_start, quote) orelse return null;
+
+        const module_path = line_slice[quote_start..close_index];
+        if (module_path.len == 0) return null;
+
+        var for_index = close_index + 1;
+        while (for_index < line_slice.len and std.ascii.isWhitespace(line_slice[for_index])) : (for_index += 1) {}
+
+        if (for_index + 3 > line_slice.len) return null;
+        if (!std.mem.eql(u8, line_slice[for_index .. for_index + 3], "for")) return null;
+
+        var after_for = for_index + 3;
+        while (after_for < line_slice.len and std.ascii.isWhitespace(line_slice[after_for])) : (after_for += 1) {}
+
+        if (local_offset < after_for) return null;
+
+        const prefix = std.mem.trim(u8, line_slice[after_for..local_offset], " \t");
+        const import_uri = try self.resolveImportUri(arena, uri, module_path);
+
+        if (self.files.get(import_uri) == null) {
+            self.loadImportedFile(import_uri) catch |err| {
+                log.debug("import symbol completion: failed loading '{s}' ({s})", .{ import_uri, @errorName(err) });
+            };
+        }
+
+        const import_doc = self.files.get(import_uri) orelse {
+            const chain = self.getResolverChain(uri) catch return null;
+            const config = self.getConfig(uri);
+            const project_root = config.project_root orelse ".";
+            const request = ResolveRequest{
+                .importer_uri = uri,
+                .importer_module_id = uri,
+                .import_string = module_path,
+                .project_root = project_root,
+                .module_bases = config.modules,
+            };
+
+            if (chain.resolve(request)) |result| {
+                if (result.source) |source| {
+                    const virtual_doc = Document.init(arena, source, .wren) catch return null;
+                    return self.getModuleExportedSymbols(arena, virtual_doc.module, prefix);
+                }
+            }
+            return null;
+        };
+
+        return self.getModuleExportedSymbols(arena, import_doc.module, prefix);
+    }
+
+    fn getModuleExportedSymbols(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        module: wrenalyzer.Ast.Module,
+        prefix: []const u8,
+    ) !?[]types.CompletionItem {
+        var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
+
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        const name = name_token.name();
+                        if (prefix.len == 0 or std.mem.startsWith(u8, name, prefix)) {
+                            try items.append(arena, .{
+                                .label = name,
+                                .kind = .Class,
+                            });
+                        }
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        const name = name_token.name();
+                        if (prefix.len == 0 or std.mem.startsWith(u8, name, prefix)) {
+                            try items.append(arena, .{
+                                .label = name,
+                                .kind = .Variable,
+                            });
+                        }
+                    }
+                },
+                else => {},
+            }
         }
 
         if (items.items.len == 0) return null;
