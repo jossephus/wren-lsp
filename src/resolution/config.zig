@@ -72,7 +72,7 @@ pub const ConfigLoader = struct {
                 const parent_dir = std.fs.path.dirname(pp) orelse ".";
                 var parent_config = try self.loadConfigWithExtends(pp);
                 try self.normalizePaths(&parent_config, parent_dir);
-                config = mergeConfigs(parent_config, config);
+                config = try mergeConfigs(self.allocator, parent_config, config);
             }
         }
 
@@ -211,11 +211,22 @@ pub const ConfigLoader = struct {
     }
 };
 
-fn mergeConfigs(parent: Config, child: Config) Config {
+fn mergeConfigs(allocator: std.mem.Allocator, parent: Config, child: Config) !Config {
+    const arena = if (child.arena) |a| a.allocator() else allocator;
+
+    // Concatenate parent and child modules
+    var merged_modules: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (parent.modules) |m| {
+        try merged_modules.append(arena, m);
+    }
+    for (child.modules) |m| {
+        try merged_modules.append(arena, m);
+    }
+
     return Config{
         .version = child.version,
         .extends = null,
-        .modules = if (child.modules.len > 0) child.modules else parent.modules,
+        .modules = try merged_modules.toOwnedSlice(arena),
         .resolvers = if (child.resolvers.len > 0) child.resolvers else parent.resolvers,
         .diagnostics = .{
             .missing_import = if (child.diagnostics.missing_import != .warning)
