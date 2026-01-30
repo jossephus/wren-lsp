@@ -181,10 +181,12 @@ pub const PathResolver = struct {
     }
 
     fn resolveAbsolute(_: *Self, allocator: std.mem.Allocator, import_path: []const u8) ?ResolveResult {
-        const with_ext = if (std.mem.endsWith(u8, import_path, ".wren"))
-            import_path
+        const with_ext_allocated = !std.mem.endsWith(u8, import_path, ".wren");
+        const with_ext = if (with_ext_allocated)
+            std.fmt.allocPrint(allocator, "{s}.wren", .{import_path}) catch return null
         else
-            std.fmt.allocPrint(allocator, "{s}.wren", .{import_path}) catch return null;
+            import_path;
+        defer if (with_ext_allocated) allocator.free(with_ext);
 
         if (std.fs.cwd().access(with_ext, .{ .mode = .read_only })) |_| {
             return ResolveResult{
@@ -202,16 +204,20 @@ pub const PathResolver = struct {
         const import_str = request.import_string;
 
         // Convert delimiter to path separator if delimiter is not "/"
-        const path_str = if (!std.mem.eql(u8, self.delimiter, "/") and std.mem.indexOf(u8, import_str, self.delimiter) != null)
+        const path_str_allocated = !std.mem.eql(u8, self.delimiter, "/") and std.mem.indexOf(u8, import_str, self.delimiter) != null;
+        const path_str = if (path_str_allocated)
             std.mem.replaceOwned(u8, allocator, import_str, self.delimiter, "/") catch return null
         else
             import_str;
+        defer if (path_str_allocated) allocator.free(path_str);
 
         for (self.roots) |root| {
-            const resolved_root = if (std.mem.startsWith(u8, root, "./"))
+            const resolved_root_allocated = std.mem.startsWith(u8, root, "./");
+            const resolved_root = if (resolved_root_allocated)
                 std.fs.path.join(allocator, &.{ base_dir, root[2..] }) catch continue
             else
                 root;
+            defer if (resolved_root_allocated) allocator.free(resolved_root);
 
             if (self.tryResolveFromBase(allocator, resolved_root, path_str)) |result| {
                 return result;
@@ -222,15 +228,19 @@ pub const PathResolver = struct {
     }
 
     fn tryResolveFromBase(_: *Self, allocator: std.mem.Allocator, base: []const u8, import_str: []const u8) ?ResolveResult {
-        const with_ext = if (std.mem.endsWith(u8, import_str, ".wren"))
-            import_str
+        const with_ext_allocated = !std.mem.endsWith(u8, import_str, ".wren");
+        const with_ext = if (with_ext_allocated)
+            std.fmt.allocPrint(allocator, "{s}.wren", .{import_str}) catch return null
         else
-            std.fmt.allocPrint(allocator, "{s}.wren", .{import_str}) catch return null;
+            import_str;
+        defer if (with_ext_allocated) allocator.free(with_ext);
 
         const full_path = std.fs.path.join(allocator, &.{ base, with_ext }) catch return null;
+        defer allocator.free(full_path);
 
         if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
-            const real_path = std.fs.cwd().realpathAlloc(allocator, full_path) catch full_path;
+            const real_path = std.fs.cwd().realpathAlloc(allocator, full_path) catch return null;
+            defer allocator.free(real_path);
             return ResolveResult{
                 .canonical_id = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
                 .uri = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
@@ -417,8 +427,14 @@ pub const PluginResolver = struct {
             for (response.diagnostics.?[0..response.diagnostics_len]) |diag| {
                 if (diag.message == null or diag.severity == null) continue;
                 const message = allocator.dupe(u8, std.mem.span(diag.message.?)) catch continue;
-                const severity = parseDiagnosticSeverityString(std.mem.span(diag.severity.?)) orelse continue;
-                diagnostics.append(allocator, .{ .severity = severity, .message = message }) catch continue;
+                const severity = parseDiagnosticSeverityString(std.mem.span(diag.severity.?)) orelse {
+                    allocator.free(message);
+                    continue;
+                };
+                diagnostics.append(allocator, .{ .severity = severity, .message = message }) catch {
+                    allocator.free(message);
+                    continue;
+                };
             }
             result.diagnostics = diagnostics.toOwnedSlice(allocator) catch result.diagnostics;
         }
@@ -427,7 +443,10 @@ pub const PluginResolver = struct {
             var completions: std.ArrayListUnmanaged([]const u8) = .empty;
             for (response.completions.?[0..response.completions_len]) |item| {
                 const value = allocator.dupe(u8, std.mem.span(item)) catch continue;
-                completions.append(allocator, value) catch continue;
+                completions.append(allocator, value) catch {
+                    allocator.free(value);
+                    continue;
+                };
             }
             result.completions = completions.toOwnedSlice(allocator) catch result.completions;
         }
@@ -478,7 +497,8 @@ fn buildModuleBasePaths(
 fn freeModuleBasePaths(allocator: std.mem.Allocator, bases: []const [*:0]const u8) void {
     if (bases.len == 0) return;
     for (bases) |base| {
-        allocator.free(std.mem.span(base));
+        const len = std.mem.len(base);
+        allocator.free(base[0 .. len + 1]);
     }
     allocator.free(bases);
 }

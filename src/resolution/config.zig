@@ -24,6 +24,9 @@ pub const ConfigLoader = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.config_path) |cp| {
+                self.allocator.free(cp);
+            }
             entry.value_ptr.deinit(self.allocator);
         }
         self.cache.deinit(self.allocator);
@@ -38,6 +41,7 @@ pub const ConfigLoader = struct {
             const project_root = std.fs.path.dirname(config_path) orelse config_path;
 
             if (self.cache.get(project_root)) |cached| {
+                self.allocator.free(config_path);
                 return cached;
             }
 
@@ -69,6 +73,7 @@ pub const ConfigLoader = struct {
             const parent_path = try self.resolveExtendsPath(config_dir, extends_path);
 
             if (parent_path) |pp| {
+                defer self.allocator.free(pp);
                 const parent_dir = std.fs.path.dirname(pp) orelse ".";
                 var parent_config = try self.loadConfigWithExtends(pp);
                 try self.normalizePaths(&parent_config, parent_dir);
@@ -280,7 +285,13 @@ fn parseResolverAlloc(value: std.json.Value, arena: std.mem.Allocator) !?Resolve
         },
         .plugin => {
             if (obj.get("library")) |v| {
-                if (v == .string) config.plugin.library = try arena.dupe(u8, v.string);
+                if (v == .string and v.string.len > 0) {
+                    config.plugin.library = try arena.dupe(u8, v.string);
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
             }
             if (obj.get("fallbackToBuiltin")) |v| {
                 if (v == .bool) config.plugin.fallback_to_builtin = v.bool;
