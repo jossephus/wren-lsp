@@ -808,15 +808,11 @@ pub const Handler = struct {
             log.debug("member completion: import path for '{s}' is '{s}'", .{ receiver_name, import_path });
             const import_uri = try self.resolveImportUri(arena, uri, import_path);
             log.debug("member completion: resolved import uri '{s}'", .{import_uri});
-            if (self.files.get(import_uri) == null) {
-                self.loadImportedFile(import_uri) catch |err| {
-                    log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
-                };
-            }
 
-            const import_doc = self.files.get(import_uri) orelse return null;
-            log.debug("member completion: imported doc found for '{s}'", .{import_uri});
-            return self.getClassStaticCompletionsInModule(arena, import_doc.module, receiver_name);
+            // Follow the import chain to find the original class definition
+            if (try self.resolveClassDefinition(arena, import_uri, receiver_name, 0)) |result| {
+                return self.getClassStaticCompletionsInModule(arena, result.module, receiver_name);
+            }
         }
 
         if (try self.findImportModuleByClassName(arena, doc, receiver_name, uri)) |module| {
@@ -824,6 +820,94 @@ pub const Handler = struct {
         }
 
         return null;
+    }
+
+    const SymbolDefinitionResult = struct {
+        module: wrenalyzer.Ast.Module,
+        uri: []const u8,
+        is_class: bool,
+    };
+
+    /// Recursively follows import chains to find the original symbol definition.
+    /// Returns the module containing the actual ClassStmt or VarStmt for the given symbol.
+    fn resolveSymbolDefinition(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        symbol_name: []const u8,
+        visited: *std.StringHashMapUnmanaged(void),
+    ) !?SymbolDefinitionResult {
+        // Cycle detection
+        if (visited.contains(uri)) return null;
+        try visited.put(arena, uri, {});
+
+        // Safety limit
+        if (visited.count() > 32) return null;
+
+        if (self.files.get(uri) == null) {
+            self.loadImportedFile(uri) catch |err| {
+                log.debug("resolveSymbolDefinition: failed loading '{s}' ({s})", .{ uri, @errorName(err) });
+                return null;
+            };
+        }
+
+        const doc = self.files.get(uri) orelse return null;
+
+        // Check if the symbol is defined directly in this module
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    if (class_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) {
+                            return .{ .module = doc.module, .uri = uri, .is_class = true };
+                        }
+                    }
+                },
+                .VarStmt => |var_stmt| {
+                    if (var_stmt.name) |name_token| {
+                        if (std.mem.eql(u8, name_token.name(), symbol_name)) {
+                            return .{ .module = doc.module, .uri = uri, .is_class = false };
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Symbol not found directly, check if it's a re-exported import
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ImportStmt => |import_stmt| {
+                    const variables = import_stmt.variables orelse continue;
+                    const path_token = import_stmt.path orelse continue;
+
+                    for (variables) |maybe_var| {
+                        const var_token = maybe_var orelse continue;
+                        if (std.mem.eql(u8, var_token.name(), symbol_name)) {
+                            // Found the re-export, follow the chain
+                            const import_path = stripQuotes(path_token.name());
+                            const next_uri = try self.resolveImportUri(arena, uri, import_path);
+                            return self.resolveSymbolDefinition(arena, next_uri, symbol_name, visited);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
+    /// Convenience wrapper that creates a visited set for resolveSymbolDefinition.
+    fn resolveClassDefinition(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        class_name: []const u8,
+        _: usize,
+    ) !?SymbolDefinitionResult {
+        var visited: std.StringHashMapUnmanaged(void) = .empty;
+        return self.resolveSymbolDefinition(arena, uri, class_name, &visited);
     }
 
     fn getClassInstanceCompletions(
@@ -839,14 +923,13 @@ pub const Handler = struct {
 
         const import_path = self.findImportPath(doc, class_name) orelse return null;
         const import_uri = try self.resolveImportUri(arena, uri, import_path);
-        if (self.files.get(import_uri) == null) {
-            self.loadImportedFile(import_uri) catch |err| {
-                log.debug("member completion: failed loading import '{s}' ({s})", .{ import_uri, @errorName(err) });
-            };
+
+        // Follow the import chain to find the original class definition
+        if (try self.resolveClassDefinition(arena, import_uri, class_name, 0)) |result| {
+            return self.getClassInstanceCompletionsInModule(arena, result.module, class_name);
         }
 
-        const import_doc = self.files.get(import_uri) orelse return null;
-        return self.getClassInstanceCompletionsInModule(arena, import_doc.module, class_name);
+        return null;
     }
 
     fn getClassStaticCompletionsInModule(
@@ -1093,8 +1176,12 @@ pub const Handler = struct {
     }
 
     fn stripQuotes(value: []const u8) []const u8 {
-        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
-            return value[1 .. value.len - 1];
+        if (value.len >= 2) {
+            const first = value[0];
+            const last = value[value.len - 1];
+            if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+                return value[1 .. value.len - 1];
+            }
         }
         return value;
     }
@@ -1764,28 +1851,40 @@ pub const Handler = struct {
                 if (self.getSymbolSourceModule(arena, params.textDocument.uri, symbol_name)) |source_uri| {
                     log.info("definition: found source module '{s}'", .{source_uri});
 
-                    // Load the source file if not already loaded
-                    if (self.files.get(source_uri) == null) {
-                        self.loadImportedFile(source_uri) catch {};
-                    }
-
-                    if (self.files.get(source_uri)) |source_doc| {
-                        // Find the symbol definition in the source module
-                        if (self.findSymbolInModule(source_doc, symbol_name)) |source_token| {
-                            log.info("definition: found symbol in source module", .{});
-                            return .{
-                                .Definition = .{
-                                    .Location = .{
-                                        .uri = source_uri,
-                                        .range = tokenToRange(source_token),
+                    // Follow the import chain to find the original definition
+                    if (try self.resolveClassDefinition(arena, source_uri, symbol_name, 0)) |result| {
+                        log.info("definition: resolved to original module '{s}'", .{result.uri});
+                        if (self.files.get(result.uri)) |original_doc| {
+                            if (self.findSymbolInModule(original_doc, symbol_name)) |source_token| {
+                                log.info("definition: found symbol in original module", .{});
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = result.uri,
+                                            .range = tokenToRange(source_token),
+                                        },
                                     },
-                                },
-                            };
-                        } else {
-                            log.info("definition: symbol not found in source module", .{});
+                                };
+                            }
                         }
                     } else {
-                        log.info("definition: source doc not loaded", .{});
+                        // Fallback to direct lookup if not a class (could be a variable)
+                        if (self.files.get(source_uri) == null) {
+                            self.loadImportedFile(source_uri) catch {};
+                        }
+                        if (self.files.get(source_uri)) |source_doc| {
+                            if (self.findSymbolInModule(source_doc, symbol_name)) |source_token| {
+                                log.info("definition: found symbol in source module", .{});
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = source_uri,
+                                            .range = tokenToRange(source_token),
+                                        },
+                                    },
+                                };
+                            }
+                        }
                     }
                 } else {
                     log.info("definition: no source module found for '{s}'", .{symbol_name});
@@ -1839,6 +1938,25 @@ pub const Handler = struct {
                     }
 
                     if (class_name != null and source_uri != null) {
+                        // Follow the import chain to find the original class definition
+                        if (try self.resolveClassDefinition(arena, source_uri.?, class_name.?, 0)) |result| {
+                            log.info("definition: method - resolved class to original module '{s}'", .{result.uri});
+                            if (self.files.get(result.uri)) |original_doc| {
+                                if (findMethodInClassWithKind(original_doc, class_name.?, method_name, method_kind)) |method_token| {
+                                    log.info("definition: found method in original module", .{});
+                                    return .{
+                                        .Definition = .{
+                                            .Location = .{
+                                                .uri = result.uri,
+                                                .range = tokenToRange(method_token),
+                                            },
+                                        },
+                                    };
+                                }
+                            }
+                        }
+
+                        // Fallback to direct lookup in immediate import
                         if (self.files.get(source_uri.?) == null) {
                             self.loadImportedFile(source_uri.?) catch {};
                         }
@@ -1915,6 +2033,38 @@ pub const Handler = struct {
                     }
 
                     if (class_name != null and source_uri != null) {
+                        // Follow the import chain to find the original class definition
+                        if (try self.resolveClassDefinition(arena, source_uri.?, class_name.?, 0)) |result| {
+                            log.info("definition: field - resolved class to original module '{s}'", .{result.uri});
+                            if (self.files.get(result.uri)) |original_doc| {
+                                // Try field first
+                                if (self.findFieldInClass(original_doc, class_name.?, field_name)) |field_token| {
+                                    log.info("definition: found field in original module", .{});
+                                    return .{
+                                        .Definition = .{
+                                            .Location = .{
+                                                .uri = result.uri,
+                                                .range = tokenToRange(field_token),
+                                            },
+                                        },
+                                    };
+                                }
+                                // Try getter method (property)
+                                if (findMethodInClassWithKind(original_doc, class_name.?, field_name, .instance)) |method_token| {
+                                    log.info("definition: found property getter in original module", .{});
+                                    return .{
+                                        .Definition = .{
+                                            .Location = .{
+                                                .uri = result.uri,
+                                                .range = tokenToRange(method_token),
+                                            },
+                                        },
+                                    };
+                                }
+                            }
+                        }
+
+                        // Fallback to direct lookup in immediate import
                         if (self.files.get(source_uri.?) == null) {
                             self.loadImportedFile(source_uri.?) catch {};
                         }
