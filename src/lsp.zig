@@ -746,27 +746,50 @@ pub const Handler = struct {
         var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
 
         for (module.statements) |stmt| {
-            const name_and_kind: ?struct { []const u8, types.CompletionItemKind } = switch (stmt) {
-                .ClassStmt => |s| if (s.name) |t| .{ t.name(), .Class } else null,
-                .VarStmt => |s| if (s.name) |t| .{ t.name(), .Variable } else null,
-                else => null,
-            };
-
-            if (name_and_kind) |nk| {
-                const name, const kind = nk;
-                const matches_prefix = prefix.len == 0 or std.mem.startsWith(u8, name, prefix);
-                const already_used = for (already_imported) |imported| {
-                    if (std.mem.eql(u8, imported, name)) break true;
-                } else false;
-
-                if (matches_prefix and !already_used) {
-                    try items.append(arena, .{ .label = name, .kind = kind });
-                }
+            switch (stmt) {
+                .ClassStmt => |s| {
+                    if (s.name) |t| {
+                        const name = t.name();
+                        if (shouldIncludeSymbol(name, prefix, already_imported)) {
+                            try items.append(arena, .{ .label = name, .kind = .Class });
+                        }
+                    }
+                },
+                .VarStmt => |s| {
+                    if (s.name) |t| {
+                        const name = t.name();
+                        if (shouldIncludeSymbol(name, prefix, already_imported)) {
+                            try items.append(arena, .{ .label = name, .kind = .Variable });
+                        }
+                    }
+                },
+                .ImportStmt => |import_stmt| {
+                    // Imported symbols become global variables that can be re-exported
+                    if (import_stmt.variables) |vars| {
+                        for (vars) |var_token| {
+                            if (var_token) |t| {
+                                const name = t.name();
+                                if (shouldIncludeSymbol(name, prefix, already_imported)) {
+                                    try items.append(arena, .{ .label = name, .kind = .Variable });
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
             }
         }
 
         if (items.items.len == 0) return null;
         return items.items;
+    }
+
+    fn shouldIncludeSymbol(name: []const u8, prefix: []const u8, already_imported: []const []const u8) bool {
+        const matches_prefix = prefix.len == 0 or std.mem.startsWith(u8, name, prefix);
+        const already_used = for (already_imported) |imported| {
+            if (std.mem.eql(u8, imported, name)) break true;
+        } else false;
+        return matches_prefix and !already_used;
     }
 
     fn getClassStaticCompletions(
@@ -1234,6 +1257,16 @@ pub const Handler = struct {
                 .VarStmt => |var_stmt| {
                     if (var_stmt.name) |name_token| {
                         if (std.mem.eql(u8, name_token.name(), symbol_name)) return true;
+                    }
+                },
+                .ImportStmt => |import_stmt| {
+                    // Imported symbols become global variables that can be re-exported
+                    if (import_stmt.variables) |vars| {
+                        for (vars) |var_token| {
+                            if (var_token) |t| {
+                                if (std.mem.eql(u8, t.name(), symbol_name)) return true;
+                            }
+                        }
                     }
                 },
                 else => {},
