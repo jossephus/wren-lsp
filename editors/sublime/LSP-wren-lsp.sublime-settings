@@ -1,0 +1,16 @@
+{
+    "command": ["${binary_path}"],
+    "enabled": true,
+    "selector": "source.wren",
+    "settings": {
+        "auto_download": true
+    },
+    "env": {},
+    "initializationOptions": {},
+    "auto_show_diagnostics_panel": true,
+    "show_diagnostics_count_in_view_status": false,
+    "show_diagnostics_highlights": true,
+    "show_code_actions": "annotation",
+    "show_view_status": true,
+    "auto_show_diagnostics_panel_level": 1
+}

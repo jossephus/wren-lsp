@@ -1,0 +1,96 @@
+{
+  "name": "wren-lsp",
+  "displayName": "Wren LSP",
+  "description": "LSP support for Wren",
+  "icon": "images/icon.png",
+  "version": "0.1.1",
+  "publisher": "jossephus",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jossephus/wren-lsp"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "wren",
+    "lsp",
+    "language-server"
+  ],
+  "activationEvents": [
+    "onLanguage:wren"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "wren",
+        "aliases": [
+          "Wren",
+          "wren"
+        ],
+        "extensions": [
+          ".wren"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wren",
+        "scopeName": "source.wren",
+        "path": "./syntaxes/wren.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "wren.updateServer",
+        "title": "Wren LSP: Update Language Server"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Wren LSP",
+      "properties": {
+        "wren.serverPath": {
+          "type": "string",
+          "default": "wren-lsp",
+          "description": "Path to the wren-lsp executable"
+        },
+        "wren.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the language server"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "compile": "npm run esbuild-base -- --sourcemap",
+    "watch": "npm run esbuild-base -- --sourcemap --watch",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.27.2",
+    "typescript": "^5.3.0"
+  }
+}
