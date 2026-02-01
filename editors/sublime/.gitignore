@@ -1,0 +1,15 @@
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.DS_Store
+Thumbs.db
+*.sublime-workspace
+*.sublime-project
+*.sublime-package
