@@ -1,6 +1,0 @@
-[
-    {
-        "caption": "Wren LSP: Update Language Server",
-        "command": "wren_lsp_update"
-    }
-]
