@@ -116,8 +116,8 @@ pub const ResolverConfig = struct {
 /// Top-level wren-lsp.json configuration.
 pub const Config = struct {
     version: u32 = 1,
-    /// Path to parent config to inherit from.
-    extends: ?[]const u8 = null,
+    /// Paths to parent configs to inherit from (later entries override earlier).
+    extends: []const []const u8 = &.{},
     /// Directories to index for Wren files.
     modules: []const []const u8 = &.{},
     /// Ordered list of resolvers.

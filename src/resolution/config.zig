@@ -69,7 +69,8 @@ pub const ConfigLoader = struct {
         var config = try self.parseConfigFile(config_path);
         const config_dir = std.fs.path.dirname(config_path) orelse ".";
 
-        if (config.extends) |extends_path| {
+        // Process extends in order - later entries override earlier ones
+        for (config.extends) |extends_path| {
             const parent_path = try self.resolveExtendsPath(config_dir, extends_path);
 
             if (parent_path) |pp| {
@@ -197,7 +198,7 @@ pub const ConfigLoader = struct {
         }
 
         if (obj.get("extends")) |v| {
-            if (v == .string) config.extends = try arena.dupe(u8, v.string);
+            config.extends = try parseStringArrayAlloc(v, arena);
         }
 
         if (obj.get("modules")) |v| {
@@ -230,7 +231,7 @@ fn mergeConfigs(allocator: std.mem.Allocator, parent: Config, child: Config) !Co
 
     return Config{
         .version = child.version,
-        .extends = null,
+        .extends = &.{},
         .modules = try merged_modules.toOwnedSlice(arena),
         .resolvers = if (child.resolvers.len > 0) child.resolvers else parent.resolvers,
         .diagnostics = .{
@@ -460,7 +461,7 @@ test "parse config with extends" {
 
     const json =
         \\{
-        \\  "extends": "./base/wren-lsp.json",
+        \\  "extends": ["./base/wren-lsp.json", "../shared"],
         \\  "modules": ["./src"]
         \\}
     ;
@@ -468,7 +469,9 @@ test "parse config with extends" {
     var cfg = try loader.parseJson(json);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("./base/wren-lsp.json", cfg.extends.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.extends.len);
+    try std.testing.expectEqualStrings("./base/wren-lsp.json", cfg.extends[0]);
+    try std.testing.expectEqualStrings("../shared", cfg.extends[1]);
     try std.testing.expectEqual(@as(usize, 1), cfg.modules.len);
 }
 
