@@ -69,6 +69,9 @@ pub const ConfigLoader = struct {
         var config = try self.parseConfigFile(config_path);
         const config_dir = std.fs.path.dirname(config_path) orelse ".";
 
+        // Normalize paths in this config relative to its directory
+        try self.normalizePaths(&config, config_dir);
+
         // Process extends in order - later entries override earlier ones
         for (config.extends) |extends_path| {
             const parent_path = try self.resolveExtendsPath(config_dir, extends_path);
@@ -89,10 +92,16 @@ pub const ConfigLoader = struct {
         const arena = if (config.arena) |a| a.allocator() else self.allocator;
 
         if (config.modules.len > 0) {
-            var norm_modules = try std.ArrayListUnmanaged([]const u8).initCapacity(arena, config.modules.len);
-            for (config.modules) |mod| {
-                const norm_path = try joinAndNormalize(arena, base_dir, mod);
-                try norm_modules.append(arena, norm_path);
+            var norm_modules = try std.ArrayListUnmanaged(types.ModuleEntry).initCapacity(arena, config.modules.len);
+            for (config.modules) |entry| {
+                const norm_entry: types.ModuleEntry = switch (entry) {
+                    .directory => |d| .{ .directory = try joinAndNormalize(arena, base_dir, d) },
+                    .named => |n| .{ .named = .{
+                        .name = n.name,
+                        .path = try joinAndNormalize(arena, base_dir, n.path),
+                    } },
+                };
+                try norm_modules.append(arena, norm_entry);
             }
             config.modules = try norm_modules.toOwnedSlice(arena);
         }
@@ -202,7 +211,7 @@ pub const ConfigLoader = struct {
         }
 
         if (obj.get("modules")) |v| {
-            config.modules = try parseStringArrayAlloc(v, arena);
+            config.modules = try parseModulesAlloc(v, arena);
         }
 
         if (obj.get("resolvers")) |v| {
@@ -221,7 +230,7 @@ fn mergeConfigs(allocator: std.mem.Allocator, parent: Config, child: Config) !Co
     const arena = if (child.arena) |a| a.allocator() else allocator;
 
     // Concatenate parent and child modules
-    var merged_modules: std.ArrayListUnmanaged([]const u8) = .empty;
+    var merged_modules: std.ArrayListUnmanaged(types.ModuleEntry) = .empty;
     for (parent.modules) |m| {
         try merged_modules.append(arena, m);
     }
@@ -334,6 +343,59 @@ fn parseStringArrayAlloc(value: std.json.Value, arena: std.mem.Allocator) ![]con
     }
 
     return strings.toOwnedSlice(arena);
+}
+
+/// Parse modules array supporting both strings and named module objects.
+/// Strings are treated as directory paths. Objects must have exactly one key
+/// with a non-empty string value, mapping a module name to a file path.
+fn parseModulesAlloc(value: std.json.Value, arena: std.mem.Allocator) ![]const types.ModuleEntry {
+    if (value != .array) return &.{};
+
+    var entries: std.ArrayListUnmanaged(types.ModuleEntry) = .empty;
+
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |s| {
+                if (s.len == 0) continue;
+                try entries.append(arena, .{ .directory = try arena.dupe(u8, s) });
+            },
+            .object => |obj| {
+                // Named modules must have exactly one key
+                if (obj.count() != 1) {
+                    log.warn("modules entry object must have exactly 1 key, got {d}", .{obj.count()});
+                    continue;
+                }
+                var iter = obj.iterator();
+                const kv = iter.next() orelse continue;
+
+                const name = kv.key_ptr.*;
+                if (name.len == 0) {
+                    log.warn("modules entry has empty module name", .{});
+                    continue;
+                }
+
+                if (kv.value_ptr.* != .string) {
+                    log.warn("modules entry value must be a string path", .{});
+                    continue;
+                }
+                const path = kv.value_ptr.string;
+                if (path.len == 0) {
+                    log.warn("modules entry has empty path for '{s}'", .{name});
+                    continue;
+                }
+
+                try entries.append(arena, .{
+                    .named = .{
+                        .name = try arena.dupe(u8, name),
+                        .path = try arena.dupe(u8, path),
+                    },
+                });
+            },
+            else => {},
+        }
+    }
+
+    return entries.toOwnedSlice(arena);
 }
 
 /// Join base_dir with path and normalize, preserving path semantics.
@@ -450,9 +512,44 @@ test "parse full config" {
 
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(@as(usize, 2), cfg.modules.len);
+    try std.testing.expectEqual(types.ModuleEntry.directory, std.meta.activeTag(cfg.modules[0]));
+    try std.testing.expectEqualStrings("./src", cfg.modules[0].directory);
     try std.testing.expectEqual(@as(usize, 2), cfg.resolvers.len);
     try std.testing.expectEqualStrings(".", cfg.resolvers[0].path.delimiter);
     try std.testing.expectEqual(types.DiagnosticSeverity.@"error", cfg.diagnostics.missing_import);
+}
+
+test "parse modules with mixed syntax" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var loader = ConfigLoader.init(arena);
+
+    const json =
+        \\{
+        \\  "modules": [
+        \\    "./src",
+        \\    {"sample-name": "./src/io.wren"},
+        \\    {"another-mod": "./lib/utils.wren"}
+        \\  ]
+        \\}
+    ;
+
+    const cfg = try loader.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.modules.len);
+
+    try std.testing.expectEqual(types.ModuleEntry.directory, std.meta.activeTag(cfg.modules[0]));
+    try std.testing.expectEqualStrings("./src", cfg.modules[0].directory);
+
+    try std.testing.expectEqual(types.ModuleEntry.named, std.meta.activeTag(cfg.modules[1]));
+    try std.testing.expectEqualStrings("sample-name", cfg.modules[1].named.name);
+    try std.testing.expectEqualStrings("./src/io.wren", cfg.modules[1].named.path);
+
+    try std.testing.expectEqual(types.ModuleEntry.named, std.meta.activeTag(cfg.modules[2]));
+    try std.testing.expectEqualStrings("another-mod", cfg.modules[2].named.name);
+    try std.testing.expectEqualStrings("./lib/utils.wren", cfg.modules[2].named.path);
 }
 
 test "parse config with extends" {

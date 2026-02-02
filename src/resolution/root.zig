@@ -14,6 +14,7 @@ pub const ResolveRequest = types.ResolveRequest;
 pub const ResolveResult = types.ResolveResult;
 pub const DiagnosticsConfig = types.DiagnosticsConfig;
 pub const DiagnosticSeverity = types.DiagnosticSeverity;
+pub const ModuleEntry = types.ModuleEntry;
 
 test {
     _ = @import("test_resolution.zig");

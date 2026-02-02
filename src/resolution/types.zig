@@ -80,6 +80,39 @@ pub const DiagnosticsConfig = struct {
     unknown_variable: DiagnosticSeverity = .@"error",
 };
 
+/// Module entry - either a directory path or a named module mapping.
+pub const ModuleEntry = union(enum) {
+    /// Directory path to scan for .wren files.
+    directory: []const u8,
+    /// Named module: maps a module name to a specific file path.
+    named: NamedModule,
+
+    pub const NamedModule = struct {
+        name: []const u8,
+        path: []const u8,
+    };
+
+    /// Get the path for this entry (directory path or named module's file path).
+    pub fn getPath(self: ModuleEntry) []const u8 {
+        return switch (self) {
+            .directory => |d| d,
+            .named => |n| n.path,
+        };
+    }
+
+    /// Extract directory paths from a slice of module entries.
+    pub fn extractDirectories(allocator: std.mem.Allocator, entries: []const ModuleEntry) ![]const []const u8 {
+        var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (entries) |entry| {
+            switch (entry) {
+                .directory => |d| try dirs.append(allocator, d),
+                .named => {},
+            }
+        }
+        return dirs.toOwnedSlice(allocator);
+    }
+};
+
 /// Resolver type discriminator.
 pub const ResolverKind = enum {
     path,
@@ -118,8 +151,8 @@ pub const Config = struct {
     version: u32 = 1,
     /// Paths to parent configs to inherit from (later entries override earlier).
     extends: []const []const u8 = &.{},
-    /// Directories to index for Wren files.
-    modules: []const []const u8 = &.{},
+    /// Module entries: directories to scan or named module mappings.
+    modules: []const ModuleEntry = &.{},
     /// Ordered list of resolvers.
     resolvers: []const ResolverConfig = &.{},
     /// Diagnostic severity settings.

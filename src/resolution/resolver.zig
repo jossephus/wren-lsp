@@ -66,22 +66,24 @@ pub const ResolverChain = struct {
     }
 
     fn addDefaultResolvers(self: *ResolverChain) !void {
-        const path_resolver = try PathResolver.create(self.allocator, .{
-            .roots = if (self.config.modules.len > 0) self.config.modules else &.{"."},
-            .delimiter = "/",
-        }, self.config.project_root);
+        const path_resolver = try PathResolver.create(
+            self.allocator,
+            .{ .delimiter = "/" },
+            self.config.modules,
+            self.config.project_root,
+        );
         try self.resolvers.append(self.allocator, path_resolver);
     }
 
     fn createResolver(self: *ResolverChain, cfg: ResolverConfig) !?Resolver {
         return switch (cfg.kind) {
             .path => blk: {
-                // Use modules as default roots if no explicit roots configured
-                var path_cfg = cfg.path;
-                if (path_cfg.roots.len == 0 and self.config.modules.len > 0) {
-                    path_cfg.roots = self.config.modules;
-                }
-                break :blk try PathResolver.create(self.allocator, path_cfg, self.config.project_root);
+                break :blk try PathResolver.create(
+                    self.allocator,
+                    cfg.path,
+                    self.config.modules,
+                    self.config.project_root,
+                );
             },
             .plugin => blk: {
                 var resolver = try PluginResolver.create(self.allocator, cfg.plugin, self.config.project_root);
@@ -123,17 +125,41 @@ pub const ResolverChain = struct {
 
 /// Path resolver - treats import strings as file paths.
 /// Supports custom delimiter for dotted imports (e.g., "game.physics" -> "game/physics.wren").
+/// Also supports named modules which take priority over directory-based resolution.
 pub const PathResolver = struct {
     roots: []const []const u8,
+    named_modules: []const types.ModuleEntry.NamedModule,
     delimiter: []const u8,
     project_root: ?[]const u8,
 
     const Self = @This();
 
-    pub fn create(allocator: std.mem.Allocator, cfg: types.PathResolverConfig, project_root: ?[]const u8) !Resolver {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        cfg: types.PathResolverConfig,
+        modules: []const types.ModuleEntry,
+        project_root: ?[]const u8,
+    ) !Resolver {
+        // Extract directory roots and named modules from module entries
+        var roots: std.ArrayListUnmanaged([]const u8) = .empty;
+        var named: std.ArrayListUnmanaged(types.ModuleEntry.NamedModule) = .empty;
+
+        for (modules) |entry| {
+            switch (entry) {
+                .directory => |d| try roots.append(allocator, d),
+                .named => |n| try named.append(allocator, n),
+            }
+        }
+
+        // Add explicit roots from config
+        for (cfg.roots) |root| {
+            try roots.append(allocator, root);
+        }
+
         const self = try allocator.create(Self);
         self.* = .{
-            .roots = cfg.roots,
+            .roots = try roots.toOwnedSlice(allocator),
+            .named_modules = try named.toOwnedSlice(allocator),
             .delimiter = cfg.delimiter,
             .project_root = project_root,
         };
@@ -153,6 +179,8 @@ pub const PathResolver = struct {
 
     fn deinitImpl(ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        allocator.free(self.roots);
+        allocator.free(self.named_modules);
         allocator.destroy(self);
     }
 
@@ -169,8 +197,41 @@ pub const PathResolver = struct {
             return self.resolveAbsolute(allocator, import_str);
         }
 
+        // Named modules take priority over directory-based resolution
+        if (self.resolveNamedModule(allocator, import_str)) |result| {
+            return result;
+        }
+
         // Handle delimiter-based imports (e.g., "game.physics" with delimiter ".")
         return self.resolveFromRoots(allocator, request);
+    }
+
+    fn resolveNamedModule(self: *Self, allocator: std.mem.Allocator, import_str: []const u8) ?ResolveResult {
+        // Search from end so "last one wins" - matches merge semantics where child overrides parent
+        var i: usize = self.named_modules.len;
+        while (i > 0) {
+            i -= 1;
+            const named = self.named_modules[i];
+            if (!std.mem.eql(u8, named.name, import_str)) continue;
+
+            const base_dir = self.project_root orelse ".";
+            const resolved_path = if (std.fs.path.isAbsolute(named.path))
+                allocator.dupe(u8, named.path) catch return null
+            else
+                std.fs.path.join(allocator, &.{ base_dir, named.path }) catch return null;
+            defer allocator.free(resolved_path);
+
+            if (std.fs.cwd().access(resolved_path, .{ .mode = .read_only })) |_| {
+                const real_path = std.fs.cwd().realpathAlloc(allocator, resolved_path) catch return null;
+                defer allocator.free(real_path);
+                return ResolveResult{
+                    .canonical_id = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
+                    .uri = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
+                    .kind = .file,
+                };
+            } else |_| {}
+        }
+        return null;
     }
 
     fn resolveRelative(self: *Self, allocator: std.mem.Allocator, request: ResolveRequest) ?ResolveResult {

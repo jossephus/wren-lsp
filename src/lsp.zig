@@ -493,12 +493,13 @@ pub const Handler = struct {
         const project_root = config.project_root orelse ".";
 
         const chain = self.getResolverChain(uri) catch return null;
+        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
         const request = ResolveRequest{
             .importer_uri = uri,
             .importer_module_id = uri,
             .import_string = prefix,
             .project_root = project_root,
-            .module_bases = config.modules,
+            .module_bases = module_bases,
         };
 
         if (chain.resolve(request)) |result| {
@@ -526,14 +527,30 @@ pub const Handler = struct {
     ) !?[]types.CompletionItem {
         const config = self.getConfig(uri);
         const project_root = config.project_root orelse ".";
+        const module_dirs = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
 
         const trimmed_prefix = if (std.mem.startsWith(u8, prefix, "./")) prefix[2..] else prefix;
         const needs_dot = std.mem.startsWith(u8, prefix, "./");
 
         var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
 
+        for (config.modules) |entry| {
+            switch (entry) {
+                .named => |named| {
+                    if (prefix.len == 0 or std.mem.startsWith(u8, named.name, prefix)) {
+                        try items.append(arena, .{
+                            .label = named.name,
+                            .kind = .Module,
+                            .insertText = named.name,
+                        });
+                    }
+                },
+                .directory => {},
+            }
+        }
+
         // Scan configured module directories
-        for (config.modules) |mod_path| {
+        for (module_dirs) |mod_path| {
             const resolved_path = if (std.mem.startsWith(u8, mod_path, "./"))
                 try std.fs.path.join(arena, &.{ project_root, mod_path[2..] })
             else if (!std.fs.path.isAbsolute(mod_path))
@@ -719,12 +736,13 @@ pub const Handler = struct {
         const chain = self.getResolverChain(uri) catch return null;
         const config = self.getConfig(uri);
         const project_root = config.project_root orelse ".";
+        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
         const request = ResolveRequest{
             .importer_uri = uri,
             .importer_module_id = uri,
             .import_string = module_path,
             .project_root = project_root,
-            .module_bases = config.modules,
+            .module_bases = module_bases,
         };
 
         if (chain.resolve(request)) |result| {
@@ -1138,12 +1156,14 @@ pub const Handler = struct {
             return self.resolveImportUriFallback(arena, uri, import_path);
         };
 
+        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
+
         const request = ResolveRequest{
             .importer_uri = uri,
             .importer_module_id = uri,
             .import_string = import_path,
             .project_root = project_root,
-            .module_bases = config.modules,
+            .module_bases = module_bases,
         };
 
         if (chain.resolve(request)) |result| {
@@ -1209,6 +1229,8 @@ pub const Handler = struct {
         const config = self.getConfig(uri);
         const diag_config = config.diagnostics;
         const project_root = config.project_root orelse ".";
+        const module_bases = resolution.ModuleEntry.extractDirectories(self.gpa, config.modules) catch &.{};
+        defer if (module_bases.len > 0) self.gpa.free(module_bases);
 
         const chain = self.getResolverChain(uri) catch null;
 
@@ -1244,7 +1266,7 @@ pub const Handler = struct {
                             .importer_module_id = uri,
                             .import_string = raw_path,
                             .project_root = project_root,
-                            .module_bases = config.modules,
+                            .module_bases = module_bases,
                         };
                         if (c.resolve(request)) |result| {
                             self.reportResolverDiagnostics(doc, path_token, result.diagnostics);
@@ -1645,8 +1667,9 @@ pub const Handler = struct {
         if (std.fs.cwd().access(config_path, .{ .mode = .read_only })) |_| {
             const dummy_uri = try std.fmt.allocPrint(arena, "file://{s}/dummy.wren", .{dir_path});
             const config = self.config_loader.loadForFile(dummy_uri) catch return;
+            const module_dirs = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
 
-            for (config.modules) |mod_dir| {
+            for (module_dirs) |mod_dir| {
                 if (!scanned_dirs.contains(mod_dir)) {
                     log.info("Scanning external module: {s}", .{mod_dir});
                     try self.scanWrenFiles(arena, mod_dir, scanned_dirs, file_count, progress_token);
