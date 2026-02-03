@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wren LSP</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <pre class="logo" aria-label="Wren LSP">
+ _      __              __   ________
+| | /| / /______ ___   / /  / __/ _ \
+| |/ |/ / __/ -_) _ \ / /__/\ \/ ___/
+|__/|__/_/  \__/_//_//____/___/_/
+</pre>
+      <p>A language server for Wren.</p>
+
+      <ul class="features">
+        <li>Diagnostics</li>
+        <li>Completion</li>
+        <li>Hover</li>
+        <li>Go to definition</li>
+        <li>References</li>
+        <li>Rename</li>
+        <li>Signature help</li>
+        <li>Semantic tokens</li>
+        <li>Document symbols</li>
+        <li>Workspace symbols</li>
+        <li>Code actions</li>
+        <li>Folding ranges</li>
+        <li>Selection range</li>
+        <li>Inlay hints</li>
+      </ul>
+
+      <hr />
+
+      <section id="editors">
+        <h2>Editors</h2>
+
+        <dl>
+          <dt>VS Code</dt>
+          <dd>Install from the <a href="https://marketplace.visualstudio.com/items?itemName=jossephus.wren-lsp">Visual Studio Marketplace</a>.</dd>
+
+          <dt>Neovim</dt>
+          <dd>See setup instructions in the <a href="https://github.com/jossephus/wren-lsp#neovim">README</a>.</dd>
+
+          <dt>Sublime Text</dt>
+          <dd>Install <a href="https://packagecontrol.io/packages/LSP-wren-lsp">LSP-wren-lsp</a> from Package Control.</dd>
+        </dl>
+      </section>
+
+      <hr />
+
+      <section id="configuration">
+        <h2>Configuration</h2>
+        <p>
+          Place a <code>wren-lsp.json</code> in your project root. The server
+          searches upward from each opened file to find it.
+        </p>
+
+        <pre><code>{
+  "version": 1,
+  "extends": ["~/.config/wren-lsp/base.json"],
+  "modules": [
+    "./src",
+    "./lib",
+    { "game": "./src/game.wren" }
+  ],
+  "resolvers": [
+    { "type": "path", "roots": ["./src"], "delimiter": "/" },
+    { "type": "plugin", "library": "./resolver" }
+  ],
+  "diagnostics": {
+    "missing_import": "warning",
+    "extension_in_import": "info",
+    "unknown_variable": "error"
+  }
+}</code></pre>
+
+        <h3>version</h3>
+        <p>Schema version. Currently <code>1</code>.</p>
+
+        <h3>extends</h3>
+        <p>Paths to parent configs. Later entries override earlier ones.</p>
+
+        <h3>modules</h3>
+        <p>Where to find Wren files. Each entry is either:</p>
+        <ul>
+          <li>A directory path to scan for <code>.wren</code> files</li>
+          <li>A named mapping like <code>{ "name": "path" }</code> for specific modules</li>
+        </ul>
+
+        <h3>resolvers</h3>
+        <p>How imports are resolved. Tried in order until one matches.</p>
+
+        <dl class="nested">
+          <dt>path</dt>
+          <dd>Treats imports as file paths. Options: <code>roots</code>, <code>delimiter</code>.</dd>
+        </dl>
+
+        <pre><code>{
+  "type": "path",
+  "roots": ["./src", "./lib"],
+  "extensions": [".wren"],
+  "indexFiles": ["mod.wren", "init.wren"]
+}</code></pre>
+
+        <dl class="nested">
+          <dt>plugin</dt>
+          <dd>Loads a shared library for custom resolution. See <a href="#plugins">Plugins</a>.</dd>
+        </dl>
+
+        <pre><code>{
+  "type": "plugin",
+  "library": "./my-resolver"
+}</code></pre>
+
+        <h3>diagnostics</h3>
+        <p>Severity for each diagnostic. Values: <code>error</code>, <code>warning</code>, <code>info</code>, <code>hint</code>, <code>none</code>.</p>
+
+        <dl class="nested">
+          <dt>missing_import</dt>
+          <dd>Import could not be resolved. Default: warning.</dd>
+
+          <dt>extension_in_import</dt>
+          <dd>Import includes <code>.wren</code> extension. Default: info.</dd>
+
+          <dt>unknown_variable</dt>
+          <dd>Variable not found in scope. Default: error.</dd>
+        </dl>
+      </section>
+
+      <hr />
+
+      <section id="plugins">
+        <h2>Plugins</h2>
+        <p>
+          Plugins are shared libraries that resolve imports using custom logic.
+          Useful for game engines or frameworks with their own module systems.
+        </p>
+
+        <p>
+          The <code>library</code> path should omit the extension—it is added
+          automatically (<code>.so</code>, <code>.dylib</code>, <code>.dll</code>).
+        </p>
+
+        <h3>C Interface</h3>
+        <p>Your library must export two functions with C linkage:</p>
+
+        <pre><code>typedef struct {
+    const char* severity;  // "error", "warning", "info", "hint"
+    const char* message;
+} WrenLspDiagnostic;
+
+typedef struct {
+    const char* canonical_id;  // required if resolved
+    const char* uri;           // file:// URI or null
+    const char* source;        // virtual source or null
+    const char* kind;          // "file", "virtual", or "remote"
+    WrenLspDiagnostic* diagnostics;
+    size_t diagnostics_len;
+} WrenLspResolveResult;
+
+WrenLspResolveResult wren_lsp_resolve_module(
+    const char* importer_uri,
+    const char* import_string,
+    const char* project_root
+);
+
+void wren_lsp_free_result(WrenLspResolveResult result);</code></pre>
+
+        <h3>Parameters</h3>
+        <dl>
+          <dt>importer_uri</dt>
+          <dd>File URI of the importing file.</dd>
+
+          <dt>import_string</dt>
+          <dd>The import string to resolve.</dd>
+
+          <dt>project_root</dt>
+          <dd>Absolute path to the project root.</dd>
+        </dl>
+
+        <h3>Return Value</h3>
+        <p>
+          Set <code>canonical_id</code> to the resolved module identifier.
+          Return null to indicate the import could not be resolved.
+        </p>
+
+        <p>
+          Set <code>kind</code> to <code>"file"</code> and <code>uri</code> to the file path.
+        </p>
+
+        <p>
+          The LSP calls <code>wren_lsp_free_result</code> after processing,
+          so you can free any memory allocated for the result.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>
