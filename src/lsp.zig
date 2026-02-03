@@ -288,10 +288,23 @@ pub const Handler = struct {
     }
 
     pub fn @"textDocument/didSave"(
-        _: *Handler,
-        _: std.mem.Allocator,
-        _: types.DidSaveTextDocumentParams,
-    ) !void {}
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.DidSaveTextDocumentParams,
+    ) !void {
+        // When a module is saved, re-analyze files that import from it
+        // so they get updated type information for imported symbols
+        const importers = self.getImporters(params.textDocument.uri);
+        for (importers) |importer_uri| {
+            const importer_doc = self.files.get(importer_uri) orelse continue;
+            // Re-analyze the importer with fresh import symbols
+            const src_copy = try self.gpa.dupeZ(u8, importer_doc.src);
+            defer self.gpa.free(src_copy);
+            self.loadFile(arena, src_copy, importer_uri, importer_doc.language) catch |err| {
+                log.debug("Failed to re-analyze importer {s}: {s}", .{ importer_uri, @errorName(err) });
+            };
+        }
+    }
 
     pub fn @"textDocument/didClose"(
         self: *Handler,
@@ -1827,7 +1840,24 @@ pub const Handler = struct {
 
         log.debug("hover: symbol '{s}' kind={s}", .{ sym.name, @tagName(sym.kind) });
 
-        const kind_str = switch (sym.kind) {
+        const content = try self.formatSymbolHover(arena, sym.name, sym.kind, sym.inferred_type, sym.fn_arity, sym.class_name);
+
+        return .{
+            .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
+            .range = range orelse tokenToRange(sym.token),
+        };
+    }
+
+    fn formatSymbolHover(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        kind: Scope.Symbol.Kind,
+        inferred_type: ?Scope.Symbol.InferredType,
+        fn_arity: ?usize,
+        class_name: ?[]const u8,
+    ) ![]const u8 {
+        const kind_str = switch (kind) {
             .variable => "variable",
             .parameter => "parameter",
             .class => "class",
@@ -1837,12 +1867,28 @@ pub const Handler = struct {
             .import_var => "import",
         };
 
-        const content = try std.fmt.allocPrint(arena, "**{s}** `{s}`", .{ kind_str, sym.name });
+        const type_str: ?[]const u8 = if (inferred_type) |t| switch (t) {
+            .num => "Num",
+            .string => "String",
+            .bool_type => "Bool",
+            .null_type => "Null",
+            .list => "List",
+            .map => "Map",
+            .range => "Range",
+            .fn_type => "Fn",
+            .class_type => class_name orelse "Class",
+            .fiber => "Fiber",
+            .unknown => null,
+        } else null;
 
-        return .{
-            .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
-            .range = range orelse tokenToRange(sym.token),
-        };
+        if (type_str) |ts| {
+            if (fn_arity) |arity| {
+                return std.fmt.allocPrint(arena, "**{s}** `{s}`: {s} (arity {d})", .{ kind_str, name, ts, arity });
+            }
+            return std.fmt.allocPrint(arena, "**{s}** `{s}`: {s}", .{ kind_str, name, ts });
+        }
+
+        return std.fmt.allocPrint(arena, "**{s}** `{s}`", .{ kind_str, name });
     }
 
     pub fn @"textDocument/definition"(
@@ -1867,8 +1913,8 @@ pub const Handler = struct {
             log.info("definition: resolved symbol '{s}' kind={s}", .{ resolved.use_token.name(), @tagName(resolved.kind) });
 
             // Check if this is an imported symbol - if so, jump to the source module
-            if (resolved.kind == .import_var or resolved.kind == .class) {
-                const symbol_name = resolved.use_token.name();
+            const symbol_name = resolved.use_token.name();
+            if (self.getSymbolSourceModule(arena, params.textDocument.uri, symbol_name) != null) {
                 log.info("definition: looking for source module of '{s}'", .{symbol_name});
 
                 if (self.getSymbolSourceModule(arena, params.textDocument.uri, symbol_name)) |source_uri| {
@@ -4155,10 +4201,17 @@ pub const Handler = struct {
             .diagnostics = &.{},
         };
 
-        var doc = try Document.init(
+        // Build import symbols table from already-loaded imported modules
+        var import_symbols: std.StringHashMapUnmanaged(Document.ImportSymbolInfo) = .empty;
+        defer import_symbols.deinit(arena);
+
+        try self.buildImportSymbols(arena, new_text, uri, &import_symbols);
+
+        var doc = try Document.initWithImportSymbols(
             self.gpa,
             new_text,
             language,
+            if (import_symbols.count() > 0) &import_symbols else null,
         );
 
         try self.checkImportPaths(&doc, uri);
@@ -4218,6 +4271,85 @@ pub const Handler = struct {
             res,
             .{ .emit_null_optional_fields = false },
         );
+    }
+
+    /// Build import symbols table by parsing imports from source, loading imported modules,
+    /// and collecting their exports.
+    fn buildImportSymbols(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        src: []const u8,
+        uri: []const u8,
+        import_symbols: *std.StringHashMapUnmanaged(Document.ImportSymbolInfo),
+    ) !void {
+        // Quick parse to extract imports without full resolution
+        const source_file = try self.gpa.create(wrenalyzer.SourceFile);
+        source_file.* = try wrenalyzer.SourceFile.new(self.gpa, "temp.wren", src);
+        defer {
+            source_file.deinit();
+            self.gpa.destroy(source_file);
+        }
+
+        var reporter = wrenalyzer.Reporter.init(self.gpa);
+        defer reporter.deinit();
+
+        const lexer = try wrenalyzer.Lexer.new(self.gpa, source_file);
+        var parser = try wrenalyzer.Parser.newWithReporter(self.gpa, lexer, &reporter);
+        const module = try parser.parseModule();
+
+        // Process each import statement
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ImportStmt => |import_stmt| {
+                    const path_token = import_stmt.path orelse continue;
+                    const raw_path = stripQuotes(path_token.name());
+
+                    const import_uri = self.resolveImportUri(arena, uri, raw_path) catch continue;
+
+                    // Load the imported module if not already loaded
+                    if (self.files.get(import_uri) == null) {
+                        if (std.mem.startsWith(u8, import_uri, "file://")) {
+                            self.loadImportedFile(import_uri) catch continue;
+                        }
+                    }
+
+                    // Get exports from imported module
+                    const imported_doc = self.files.get(import_uri) orelse continue;
+
+                    // For each imported variable, look up its type in the source module
+                    if (import_stmt.variables) |vars| {
+                        for (vars) |maybe_var| {
+                            const var_token = maybe_var orelse continue;
+                            const name = var_token.name();
+
+                            if (imported_doc.exports.get(name)) |export_info| {
+                                // Deep copy methods to arena so we don't hold pointers into source doc
+                                const methods_copy: ?[]const Document.ClassMethodInfo = if (export_info.methods) |m|
+                                    arena.dupe(Document.ClassMethodInfo, m) catch null
+                                else
+                                    null;
+
+                                try import_symbols.put(arena, name, .{
+                                    .kind = export_info.kind,
+                                    .inferred_type = export_info.inferred_type,
+                                    .fn_arity = export_info.fn_arity,
+                                    .class_name = export_info.class_name,
+                                    .methods = methods_copy,
+                                });
+                                log.debug("buildImportSymbols: '{s}' -> kind={s} type={s} arity={any} methods={any}", .{
+                                    name,
+                                    @tagName(export_info.kind),
+                                    if (export_info.inferred_type) |t| @tagName(t) else "null",
+                                    export_info.fn_arity,
+                                    methods_copy != null,
+                                });
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
     }
 };
 

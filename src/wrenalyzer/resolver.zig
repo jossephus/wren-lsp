@@ -18,12 +18,30 @@ pub const ResolvedRef = struct {
     is_write: bool,
 };
 
+/// Information about a class method.
+pub const ClassMethodInfo = struct {
+    name: []const u8,
+    arity: usize,
+    is_static: bool,
+    is_constructor: bool,
+};
+
+/// Type information for an imported symbol, provided by the LSP layer.
+pub const ImportSymbolInfo = struct {
+    kind: Scope.Symbol.Kind,
+    inferred_type: ?Scope.Symbol.InferredType = null,
+    fn_arity: ?usize = null,
+    class_name: ?[]const u8 = null,
+    methods: ?[]const ClassMethodInfo = null,
+};
+
 allocator: std.mem.Allocator,
 scope: Scope,
 reporter: *Reporter,
 class_depth: usize,
 module: ?*ast.Module,
 refs_out: ?*std.ArrayListUnmanaged(ResolvedRef) = null,
+import_symbols: ?*const std.StringHashMapUnmanaged(ImportSymbolInfo) = null,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -76,7 +94,9 @@ fn resolveNode(self: *Resolver, node: *const ast.Node) void {
 
 fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
     if (stmt.name) |name| {
-        self.scope.declare(name, .class);
+        // Find constructor arity (use first constructor found, or null if none)
+        const ctor_arity = self.findConstructorArity(stmt.methods);
+        self.scope.declareWithType(name, .class, .class_type, ctor_arity, null);
     }
 
     self.scope.beginClass();
@@ -88,6 +108,21 @@ fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
 
     self.class_depth -= 1;
     self.scope.endClass();
+}
+
+fn findConstructorArity(self: *Resolver, methods: []ast.Node) ?usize {
+    _ = self;
+    for (methods) |method_node| {
+        switch (method_node) {
+            .Method => |method| {
+                if (method.constructKeyword != null) {
+                    return method.parameters.len;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn visitMethod(self: *Resolver, method: ast.Method) void {
@@ -206,6 +241,12 @@ fn visitImportStmt(self: *Resolver, stmt: ast.ImportStmt) void {
     if (stmt.variables) |vars| {
         for (vars) |maybe_var| {
             if (maybe_var) |v| {
+                if (self.import_symbols) |import_syms| {
+                    if (import_syms.get(v.name())) |info| {
+                        self.scope.declareWithType(v, info.kind, info.inferred_type, info.fn_arity, info.class_name);
+                        continue;
+                    }
+                }
                 self.scope.declare(v, .import_var);
             }
         }
@@ -375,83 +416,43 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
     const class_info = self.resolveClassReceiver(receiver) orelse return;
     const module = self.module orelse return;
 
-    const class_stmt = self.findClassStmt(module, class_info.name) orelse return;
-
     const call_name = expr.name.name();
     var arg_count: usize = expr.arguments.len;
     if (expr.blockArgument.* != null) {
         arg_count += 1;
     }
 
-    var arities: [8]usize = undefined;
-    var arity_len: usize = 0;
-    var matches_arity = false;
-    var matched_name = false;
+    if (self.findClassStmt(module, class_info.name)) |class_stmt| {
+        const methods = extractMethodsFromAst(self.allocator, class_stmt.methods) orelse return;
+        defer self.allocator.free(methods);
 
-    for (class_stmt.methods) |method_node| {
-        const method = switch (method_node) {
-            .Method => |value| value,
-            else => continue,
-        };
-
-        if (method.name == null) continue;
-        if (!std.mem.eql(u8, method.name.?.name(), call_name)) continue;
-        matched_name = true;
-
-        if (class_info.is_static) {
-            if (method.staticKeyword == null and method.constructKeyword == null) continue;
-        } else {
-            if (method.staticKeyword != null) continue;
-            if (method.constructKeyword != null) continue;
-        }
-
-        const arity = method.parameters.len;
-        if (!containsArity(arities[0..arity_len], arity)) {
-            if (arity_len < arities.len) {
-                arities[arity_len] = arity;
-                arity_len += 1;
-            }
-        }
-
-        if (arity == arg_count) {
-            matches_arity = true;
-            break;
-        }
-    }
-
-    if (matches_arity) return;
-
-    if (arity_len == 0) {
-        if (class_info.is_static and std.mem.eql(u8, call_name, "new")) return;
-        const kind_label = if (class_info.is_static) "static" else "instance";
-        var buf: [192]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &buf,
-            "Unknown {s} method {s}.{s}",
-            .{ kind_label, class_info.name, call_name },
-        ) catch "Unknown method";
-        self.reporter.reportError(expr.name, msg);
+        _ = checkMethodArity(
+            self,
+            class_info.name,
+            call_name,
+            arg_count,
+            class_info.is_static,
+            methods,
+            expr.name,
+        );
         return;
     }
 
-    const kind_label = if (class_info.is_static) "static" else "instance";
-
-    var list_buf: [64]u8 = undefined;
-    var list_stream = std.io.fixedBufferStream(&list_buf);
-    const list_writer = list_stream.writer();
-    for (arities[0..arity_len], 0..) |arity, i| {
-        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
-        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
+    if (self.import_symbols) |import_syms| {
+        if (import_syms.get(class_info.name)) |import_info| {
+            if (import_info.methods) |methods| {
+                _ = checkMethodArity(
+                    self,
+                    class_info.name,
+                    call_name,
+                    arg_count,
+                    class_info.is_static,
+                    methods,
+                    expr.name,
+                );
+            }
+        }
     }
-    const arity_list = list_stream.getWritten();
-
-    var buf: [192]u8 = undefined;
-    const msg = std.fmt.bufPrint(
-        &buf,
-        "Expected {s} arguments for {s} {s}.{s}, found {d}",
-        .{ arity_list, kind_label, class_info.name, call_name, arg_count },
-    ) catch "Incorrect argument count";
-    self.reporter.reportError(expr.name, msg);
 }
 
 fn resolveClassReceiver(self: *Resolver, receiver: *const ast.Node) ?struct { name: []const u8, is_static: bool } {
@@ -692,4 +693,109 @@ fn visitSuperExpr(self: *Resolver, expr: ast.SuperExpr) void {
     if (expr.blockArgument.*) |*block| {
         self.resolveNode(block);
     }
+}
+
+pub fn extractMethodsFromAst(gpa: std.mem.Allocator, methods: []const ast.Node) ?[]const ClassMethodInfo {
+    var method_count: usize = 0;
+    for (methods) |method_node| {
+        if (method_node == .Method) method_count += 1;
+    }
+
+    if (method_count == 0) return null;
+
+    var result = gpa.alloc(ClassMethodInfo, method_count) catch return null;
+    var idx: usize = 0;
+    for (methods) |method_node| {
+        switch (method_node) {
+            .Method => |method| {
+                if (idx >= method_count) break;
+                const method_name = if (method.name) |n| n.name() else "unknown";
+                result[idx] = .{
+                    .name = method_name,
+                    .arity = method.parameters.len,
+                    .is_static = method.staticKeyword != null,
+                    .is_constructor = method.constructKeyword != null,
+                };
+                idx += 1;
+            },
+            else => {},
+        }
+    }
+
+    return result[0..idx];
+}
+
+fn checkMethodArity(
+    self: *Resolver,
+    class_name: []const u8,
+    call_name: []const u8,
+    arg_count: usize,
+    is_static: bool,
+    methods: []const ClassMethodInfo,
+    error_token: Token,
+) bool {
+    var arities: [8]usize = undefined;
+    var arity_len: usize = 0;
+    var matches_arity = false;
+
+    for (methods) |method| {
+        if (!std.mem.eql(u8, method.name, call_name)) continue;
+
+        // Check static/constructor constraints
+        if (is_static) {
+            // For static calls, method must be static or constructor
+            if (!method.is_static and !method.is_constructor) continue;
+        } else {
+            // For instance calls, method must not be static or constructor
+            if (method.is_static or method.is_constructor) continue;
+        }
+
+        const arity = method.arity;
+        if (!containsArity(arities[0..arity_len], arity)) {
+            if (arity_len < arities.len) {
+                arities[arity_len] = arity;
+                arity_len += 1;
+            }
+        }
+
+        if (arity == arg_count) {
+            matches_arity = true;
+            break;
+        }
+    }
+
+    if (matches_arity) return true;
+
+    if (arity_len == 0) {
+        if (is_static and std.mem.eql(u8, call_name, "new")) return true;
+        const kind_label = if (is_static) "static" else "instance";
+        var buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "Unknown {s} method {s}.{s}",
+            .{ kind_label, class_name, call_name },
+        ) catch "Unknown method";
+        self.reporter.reportError(error_token, msg);
+        return true;
+    }
+
+    const kind_label = if (is_static) "static" else "instance";
+
+    var list_buf: [64]u8 = undefined;
+    var list_stream = std.io.fixedBufferStream(&list_buf);
+    const list_writer = list_stream.writer();
+    for (arities[0..arity_len], 0..) |arity, i| {
+        if (i > 0) list_writer.writeAll(" or ") catch @panic("Error formatting arity list");
+        list_writer.print("{d}", .{arity}) catch @panic("Error formatting arity list");
+    }
+    const arity_list = list_stream.getWritten();
+
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Expected {s} arguments for {s} {s}.{s}, found {d}",
+        .{ arity_list, kind_label, class_name, call_name, arg_count },
+    ) catch "Incorrect argument count";
+    self.reporter.reportError(error_token, msg);
+    return true;
 }
