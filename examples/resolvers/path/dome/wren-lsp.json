@@ -1,0 +1,9 @@
+{
+    "modules": [
+      "./lib",
+      {
+        "abc": "./lib/test.wren"
+      }
+    ],
+    "extends": ["/Users/jossephus/.local/share/dome"]
+}

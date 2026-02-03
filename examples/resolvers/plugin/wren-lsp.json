@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "modules": ["./src"],
+  "resolvers": [
+    { "type": "plugin", "library": "./math_resolver" },
+    { "type": "path", "roots": ["./src"], "delimiter": "/" }
+  ]
+}
