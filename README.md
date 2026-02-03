@@ -27,7 +27,8 @@ LSP implementation for Wren.
 ## Roadmap
 
 - [ ] Call hierarchy
-- [ ] Cross-module navigation
+- [x] Configurable module resolution
+- [ ] Cross-module navigation (multi-file)
 
 ## Releases
 
@@ -54,7 +55,7 @@ if not configs.wren_lsp then
     default_config = {
       cmd = { "wren-lsp" },
       filetypes = { "wren" },
-      root_dir = lspconfig.util.root_pattern(".git"),
+      root_dir = lspconfig.util.root_pattern("wren-lsp.json", ".git"),
     },
   }
 end
@@ -87,7 +88,11 @@ vim.api.nvim_create_autocmd("FileType", {
 
 ### VS Code
 
-*Coming soon*
+Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=jossephus.wren-lsp).
+
+### Sublime Text
+
+Install [LSP-wren-lsp](https://packagecontrol.io/packages/LSP-wren-lsp) from Package Control.
 
 ### Helix
 

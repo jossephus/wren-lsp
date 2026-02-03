@@ -1,6 +1,3 @@
-[submodule "editors/editors/sublime"]
-	path = editors/editors/sublime
-	url = git@github.com:jossephus/LSP-wren-lsp.git
 [submodule "editors/sublime"]
 	path = editors/sublime
 	url = https://github.com/jossephus/LSP-wren-lsp
