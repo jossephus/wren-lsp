@@ -128,3 +128,15 @@ dl.nested dt {
 dl.nested dt:first-child {
   margin-top: 0;
 }
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 0 0 1em;
+}
+
+.release-date {
+  font-size: 0.9em;
+  color: #606060;
+  margin: -0.25em 0 1em;
+}
