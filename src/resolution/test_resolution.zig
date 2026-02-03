@@ -47,7 +47,6 @@ test "path resolver resolves relative imports" {
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
-        .importer_module_id = "file:///tmp/test/src/main.wren",
         .import_string = "./utils",
         .project_root = "/tmp/test",
     };
@@ -69,7 +68,6 @@ test "resolver chain uses default path resolver" {
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
-        .importer_module_id = "file:///tmp/test/src/main.wren",
         .import_string = "utils",
         .project_root = "/tmp/test",
     };
@@ -92,7 +90,6 @@ test "path resolver with delimiter converts dots to slashes" {
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
-        .importer_module_id = "file:///tmp/test/src/main.wren",
         .import_string = "models.user",
         .project_root = "/tmp/test",
     };

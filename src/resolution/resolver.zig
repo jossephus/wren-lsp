@@ -323,11 +323,8 @@ pub const PluginResolver = struct {
 
     const ResolveFn = *const fn (
         importer_uri: [*:0]const u8,
-        importer_module_id: [*:0]const u8,
         import_string: [*:0]const u8,
         project_root: [*:0]const u8,
-        module_bases: ?[*]const [*:0]const u8,
-        module_bases_len: usize,
     ) callconv(.c) WrenLspResolveResult;
 
     const FreeFn = *const fn (result: WrenLspResolveResult) callconv(.c) void;
@@ -431,25 +428,15 @@ pub const PluginResolver = struct {
 
         const importer_uri = allocator.dupeZ(u8, request.importer_uri) catch return null;
         defer allocator.free(importer_uri);
-        const importer_module_id = allocator.dupeZ(u8, request.importer_module_id) catch return null;
-        defer allocator.free(importer_module_id);
         const import_string = allocator.dupeZ(u8, request.import_string) catch return null;
         defer allocator.free(import_string);
         const project_root = allocator.dupeZ(u8, request.project_root) catch return null;
         defer allocator.free(project_root);
 
-        const module_bases = buildModuleBasePaths(allocator, request.project_root, request.module_bases) catch return null;
-        defer freeModuleBasePaths(allocator, module_bases);
-
-        log.info("PluginResolver: module_bases_len={d}", .{module_bases.len});
-
         const response = resolve_fn(
             importer_uri.ptr,
-            importer_module_id.ptr,
             import_string.ptr,
             project_root.ptr,
-            if (module_bases.len > 0) @ptrCast(module_bases.ptr) else null,
-            module_bases.len,
         );
         defer if (self.free_fn) |free| free(response);
 
@@ -500,18 +487,6 @@ pub const PluginResolver = struct {
             result.diagnostics = diagnostics.toOwnedSlice(allocator) catch result.diagnostics;
         }
 
-        if (response.completions != null and response.completions_len > 0) {
-            var completions: std.ArrayListUnmanaged([]const u8) = .empty;
-            for (response.completions.?[0..response.completions_len]) |item| {
-                const value = allocator.dupe(u8, std.mem.span(item)) catch continue;
-                completions.append(allocator, value) catch {
-                    allocator.free(value);
-                    continue;
-                };
-            }
-            result.completions = completions.toOwnedSlice(allocator) catch result.completions;
-        }
-
         return result;
     }
 };
@@ -528,41 +503,7 @@ const WrenLspResolveResult = extern struct {
     kind: ?[*:0]const u8,
     diagnostics: ?[*]const WrenLspDiagnostic,
     diagnostics_len: usize,
-    completions: ?[*]const [*:0]const u8,
-    completions_len: usize,
 };
-
-fn buildModuleBasePaths(
-    allocator: std.mem.Allocator,
-    project_root: []const u8,
-    module_bases: []const []const u8,
-) ![]const [*:0]const u8 {
-    if (module_bases.len == 0) return &.{};
-
-    var bases = try allocator.alloc([*:0]const u8, module_bases.len);
-    for (module_bases, 0..) |base, idx| {
-        const resolved_base = if (std.mem.startsWith(u8, base, "./"))
-            std.fs.path.join(allocator, &.{ project_root, base[2..] }) catch base
-        else if (!std.fs.path.isAbsolute(base))
-            std.fs.path.join(allocator, &.{ project_root, base }) catch base
-        else
-            base;
-
-        defer if (resolved_base.ptr != base.ptr) allocator.free(resolved_base);
-        bases[idx] = (try allocator.dupeZ(u8, resolved_base)).ptr;
-    }
-
-    return bases;
-}
-
-fn freeModuleBasePaths(allocator: std.mem.Allocator, bases: []const [*:0]const u8) void {
-    if (bases.len == 0) return;
-    for (bases) |base| {
-        const len = std.mem.len(base);
-        allocator.free(base[0 .. len + 1]);
-    }
-    allocator.free(bases);
-}
 
 fn parseDiagnosticSeverityString(value: []const u8) ?ResolveResult.Diagnostic.Severity {
     if (std.mem.eql(u8, value, "error")) return .@"error";

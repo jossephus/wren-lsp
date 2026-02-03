@@ -17,8 +17,6 @@ pub const ResolveResult = struct {
     kind: ModuleKind = .file,
     /// Resolver-provided diagnostics.
     diagnostics: []const Diagnostic = &.{},
-    /// Resolver-provided completions.
-    completions: []const []const u8 = &.{},
 
     pub const ModuleKind = enum {
         file,
@@ -43,14 +41,10 @@ pub const ResolveResult = struct {
 pub const ResolveRequest = struct {
     /// URI of the file containing the import statement.
     importer_uri: []const u8,
-    /// Canonical module id of the importer.
-    importer_module_id: []const u8,
     /// The raw import string from the source.
     import_string: []const u8,
     /// Project root directory (where wren-lsp.json is located).
     project_root: []const u8,
-    /// Configured module base directories.
-    module_bases: []const []const u8 = &.{},
 };
 
 /// Diagnostic severity configuration.

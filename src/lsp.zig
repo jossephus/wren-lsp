@@ -490,46 +490,7 @@ pub const Handler = struct {
         }
 
         const prefix = line_slice[quote_start..local_offset];
-        if (self.getResolverImportCompletions(arena, uri, prefix)) |items| {
-            return items;
-        }
         return try self.listImportCompletions(arena, uri, prefix);
-    }
-
-    fn getResolverImportCompletions(
-        self: *Handler,
-        arena: std.mem.Allocator,
-        uri: []const u8,
-        prefix: []const u8,
-    ) ?[]types.CompletionItem {
-        const config = self.getConfig(uri);
-        const project_root = config.project_root orelse ".";
-
-        const chain = self.getResolverChain(uri) catch return null;
-        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
-        const request = ResolveRequest{
-            .importer_uri = uri,
-            .importer_module_id = uri,
-            .import_string = prefix,
-            .project_root = project_root,
-            .module_bases = module_bases,
-        };
-
-        if (chain.resolve(request)) |result| {
-            if (result.completions.len == 0) return null;
-
-            var items = arena.alloc(types.CompletionItem, result.completions.len) catch return null;
-            for (result.completions, 0..) |completion, idx| {
-                items[idx] = .{
-                    .label = completion,
-                    .kind = .File,
-                    .insertText = completion,
-                };
-            }
-            return items;
-        }
-
-        return null;
     }
 
     fn listImportCompletions(
@@ -749,13 +710,10 @@ pub const Handler = struct {
         const chain = self.getResolverChain(uri) catch return null;
         const config = self.getConfig(uri);
         const project_root = config.project_root orelse ".";
-        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
         const request = ResolveRequest{
             .importer_uri = uri,
-            .importer_module_id = uri,
             .import_string = module_path,
             .project_root = project_root,
-            .module_bases = module_bases,
         };
 
         if (chain.resolve(request)) |result| {
@@ -1169,14 +1127,10 @@ pub const Handler = struct {
             return self.resolveImportUriFallback(arena, uri, import_path);
         };
 
-        const module_bases = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
-
         const request = ResolveRequest{
             .importer_uri = uri,
-            .importer_module_id = uri,
             .import_string = import_path,
             .project_root = project_root,
-            .module_bases = module_bases,
         };
 
         if (chain.resolve(request)) |result| {
@@ -1242,8 +1196,6 @@ pub const Handler = struct {
         const config = self.getConfig(uri);
         const diag_config = config.diagnostics;
         const project_root = config.project_root orelse ".";
-        const module_bases = resolution.ModuleEntry.extractDirectories(self.gpa, config.modules) catch &.{};
-        defer if (module_bases.len > 0) self.gpa.free(module_bases);
 
         const chain = self.getResolverChain(uri) catch null;
 
@@ -1276,10 +1228,8 @@ pub const Handler = struct {
                     if (chain) |c| {
                         const request = ResolveRequest{
                             .importer_uri = uri,
-                            .importer_module_id = uri,
                             .import_string = raw_path,
                             .project_root = project_root,
-                            .module_bases = module_bases,
                         };
                         if (c.resolve(request)) |result| {
                             self.reportResolverDiagnostics(doc, path_token, result.diagnostics);
