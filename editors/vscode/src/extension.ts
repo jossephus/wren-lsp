@@ -15,7 +15,22 @@ let downloadInProgress: Promise<string> | null = null;
 const REPO = "jossephus/wren-lsp";
 const MAX_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 60000;
-const ALLOWED_HOSTS = ["github.com", "objects.githubusercontent.com", "github-releases.githubusercontent.com"];
+const ALLOWED_HOSTS = [
+  "github.com",
+  "api.github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+  "github-releases.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+  "github-production-release-asset-*.s3.amazonaws.com",
+  "codeload.github.com",
+  "gist.githubusercontent.com",
+  "avatars.githubusercontent.com",
+  "user-images.githubusercontent.com",
+  "media.githubusercontent.com",
+  "cloud.githubusercontent.com",
+  "private-user-images.githubusercontent.com",
+];
 
 interface PlatformInfo {
   platform: string;
@@ -68,7 +83,16 @@ function getBinaryName(): string {
 function isAllowedHost(urlString: string): boolean {
   try {
     const url = new URL(urlString);
-    return url.protocol === "https:" && ALLOWED_HOSTS.some(host => url.host === host || url.host.endsWith(`.${host}`));
+    if (url.protocol !== "https:") {
+      return false;
+    }
+    return ALLOWED_HOSTS.some(host => {
+      if (host.includes("*")) {
+        const pattern = new RegExp("^" + host.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+        return pattern.test(url.host);
+      }
+      return url.host === host || url.host.endsWith(`.${host}`);
+    });
   } catch {
     return false;
   }
