@@ -94,7 +94,9 @@ pub const Handler = struct {
         var file_iter = self.files.iterator();
         while (file_iter.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
+            const old_src = entry.value_ptr.src;
             entry.value_ptr.deinit(self.gpa);
+            self.gpa.free(old_src);
         }
         self.files.deinit(self.gpa);
 
@@ -313,7 +315,9 @@ pub const Handler = struct {
     ) !void {
         var kv = self.files.fetchRemove(params.textDocument.uri) orelse return;
         self.gpa.free(kv.key);
+        const old_src = kv.value.src;
         kv.value.deinit(self.gpa);
+        self.gpa.free(old_src);
     }
 
     pub fn @"textDocument/completion"(
@@ -1426,7 +1430,9 @@ pub const Handler = struct {
         errdefer _ = self.files.remove(uri);
 
         if (gop.found_existing) {
+            const old_src = gop.value_ptr.src;
             gop.value_ptr.deinit(self.gpa);
+            self.gpa.free(old_src);
         } else {
             gop.key_ptr.* = try self.gpa.dupe(u8, uri);
         }
@@ -4172,7 +4178,9 @@ pub const Handler = struct {
         errdefer _ = self.files.remove(uri);
 
         if (gop.found_existing) {
+            const old_src = gop.value_ptr.src;
             gop.value_ptr.deinit(self.gpa);
+            self.gpa.free(old_src);
         } else {
             gop.key_ptr.* = try self.gpa.dupe(u8, uri);
         }
