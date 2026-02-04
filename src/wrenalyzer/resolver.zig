@@ -315,13 +315,15 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         }
     } else {
         if (self.scope.resolveOptional(expr.name)) |sym| {
-            if (self.refs_out) |refs| {
-                refs.append(self.allocator, .{
-                    .use_token = expr.name,
-                    .decl_token = sym.token,
-                    .kind = sym.kind,
-                    .is_write = false,
-                }) catch {};
+            if (!sym.is_builtin) {
+                if (self.refs_out) |refs| {
+                    refs.append(self.allocator, .{
+                        .use_token = expr.name,
+                        .decl_token = sym.token,
+                        .kind = sym.kind,
+                        .is_write = false,
+                    }) catch {};
+                }
             }
         } else {
             // Report undefined symbol errors both at top-level and inside classes
@@ -621,13 +623,15 @@ fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
         .CallExpr => |call| {
             if (call.receiver == null) {
                 if (self.scope.resolveOptional(call.name)) |sym| {
-                    if (self.refs_out) |refs| {
-                        refs.append(self.allocator, .{
-                            .use_token = call.name,
-                            .decl_token = sym.token,
-                            .kind = sym.kind,
-                            .is_write = true,
-                        }) catch {};
+                    if (!sym.is_builtin) {
+                        if (self.refs_out) |refs| {
+                            refs.append(self.allocator, .{
+                                .use_token = call.name,
+                                .decl_token = sym.token,
+                                .kind = sym.kind,
+                                .is_write = true,
+                            }) catch {};
+                        }
                     }
                 } else {
                     // Variable not found - report error

@@ -49,6 +49,14 @@ exports: std.StringHashMapUnmanaged(ExportInfo) = .empty,
 
 const log = std.log.scoped(.wren_lsp);
 
+/// Overflow-safe bounds check for tokens.
+fn tokenInBounds(t: Token, src_len: usize) bool {
+    if (t.length == 0) return false;
+    if (t.start >= src_len) return false;
+    if (t.length > src_len - t.start) return false;
+    return true;
+}
+
 pub fn deinit(doc: *Document, gpa: std.mem.Allocator) void {
     doc.reporter.deinit();
     doc.symbols.deinit(gpa);
@@ -118,13 +126,16 @@ pub fn initWithImportSymbols(
         if (maybe_scope) |scope| {
             var iter = scope.iterator();
             while (iter.next()) |entry| {
+                const sym = entry.value_ptr.*;
+                if (sym.is_builtin) continue;
+                if (!tokenInBounds(sym.token, src.len)) continue;
                 symbols.append(gpa, .{
-                    .name = entry.value_ptr.name,
-                    .token = entry.value_ptr.token,
-                    .kind = entry.value_ptr.kind,
-                    .inferred_type = entry.value_ptr.inferred_type,
-                    .fn_arity = entry.value_ptr.fn_arity,
-                    .class_name = entry.value_ptr.class_name,
+                    .name = sym.name,
+                    .token = sym.token,
+                    .kind = sym.kind,
+                    .inferred_type = sym.inferred_type,
+                    .fn_arity = sym.fn_arity,
+                    .class_name = sym.class_name,
                 }) catch {};
             }
         }
@@ -136,8 +147,8 @@ pub fn initWithImportSymbols(
             var iter = module_scope.iterator();
             while (iter.next()) |entry| {
                 const sym = entry.value_ptr.*;
-                // Skip builtins (they have undefined/invalid tokens)
-                if (sym.token.length == 0 or sym.token.start + sym.token.length > src.len) continue;
+                if (sym.is_builtin) continue;
+                if (!tokenInBounds(sym.token, src.len)) continue;
                 // Skip imported symbols (they're not exports of this module)
                 if (sym.kind == .import_var) continue;
 

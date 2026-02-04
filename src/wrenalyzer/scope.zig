@@ -12,6 +12,7 @@ pub const Symbol = struct {
     name: []const u8,
     token: Token,
     kind: Kind,
+    is_builtin: bool = false,
     inferred_type: ?InferredType = null,
     fn_arity: ?usize = null,
     class_name: ?[]const u8 = null,
@@ -198,6 +199,7 @@ pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Scope {
             .name = name,
             .token = undefined,
             .kind = .class,
+            .is_builtin = true,
         });
     }
     try self.scopes.append(allocator, module_scope);
