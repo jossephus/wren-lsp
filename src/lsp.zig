@@ -301,9 +301,9 @@ pub const Handler = struct {
             const importer_doc = self.files.get(importer_uri) orelse continue;
             // Re-analyze the importer with fresh import symbols
             const src_copy = try self.gpa.dupeZ(u8, importer_doc.src);
-            defer self.gpa.free(src_copy);
             self.loadFile(arena, src_copy, importer_uri, importer_doc.language) catch |err| {
                 log.debug("Failed to re-analyze importer {s}: {s}", .{ importer_uri, @errorName(err) });
+                self.gpa.free(src_copy);
             };
         }
     }
