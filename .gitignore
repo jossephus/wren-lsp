@@ -4,3 +4,6 @@ zig-out
 .npm
 .plan.md.swp
 plan.md
+
+.DS_Store
+examples/samples

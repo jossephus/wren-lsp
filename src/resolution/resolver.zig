@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const builtins = @import("builtins.zig");
 const Config = types.Config;
 const ResolveRequest = types.ResolveRequest;
 const ResolveResult = types.ResolveResult;
@@ -53,6 +54,8 @@ pub const ResolverChain = struct {
 
         if (chain.resolvers.items.len == 0) {
             try chain.addDefaultResolvers();
+        } else {
+            try chain.addBuiltinResolver();
         }
 
         return chain;
@@ -73,6 +76,13 @@ pub const ResolverChain = struct {
             self.config.project_root,
         );
         try self.resolvers.append(self.allocator, path_resolver);
+
+        try self.addBuiltinResolver();
+    }
+
+    fn addBuiltinResolver(self: *ResolverChain) !void {
+        const builtin_resolver = try BuiltinResolver.create(self.allocator);
+        try self.resolvers.append(self.allocator, builtin_resolver);
     }
 
     fn createResolver(self: *ResolverChain, cfg: ResolverConfig) !?Resolver {
@@ -104,14 +114,15 @@ pub const ResolverChain = struct {
             }
         }
 
-        // Only return virtual fallback for non-path imports.
-        // Relative paths (./foo, ../foo) and absolute paths should return null
-        // so the caller can report a missing import diagnostic.
         const import_str = request.import_string;
         if (std.mem.startsWith(u8, import_str, "./") or
             std.mem.startsWith(u8, import_str, "../") or
             std.fs.path.isAbsolute(import_str))
         {
+            return null;
+        }
+
+        if (self.config.resolvers.len > 0 or self.config.modules.len > 0) {
             return null;
         }
 
@@ -310,6 +321,50 @@ pub const PathResolver = struct {
         } else |_| {}
 
         return null;
+    }
+};
+
+pub const BuiltinResolver = struct {
+    const Self = @This();
+
+    pub fn create(allocator: std.mem.Allocator) !Resolver {
+        const self = try allocator.create(Self);
+        self.* = .{};
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .resolve = &resolveImpl,
+                .deinit = &deinitImpl,
+            },
+        };
+    }
+
+    fn resolveImpl(ptr: *anyopaque, allocator: std.mem.Allocator, request: ResolveRequest) ?ResolveResult {
+        _ = ptr;
+        const import_str = request.import_string;
+
+        if (std.mem.startsWith(u8, import_str, "./") or
+            std.mem.startsWith(u8, import_str, "../") or
+            std.fs.path.isAbsolute(import_str))
+        {
+            return null;
+        }
+
+        if (builtins.getBuiltinSource(import_str)) |source| {
+            return ResolveResult{
+                .canonical_id = std.fmt.allocPrint(allocator, "wren://builtin/{s}", .{import_str}) catch return null,
+                .uri = std.fmt.allocPrint(allocator, "wren://builtin/{s}", .{import_str}) catch return null,
+                .source = source,
+                .kind = .virtual,
+            };
+        }
+
+        return null;
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 };
 

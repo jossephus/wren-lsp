@@ -1,6 +1,7 @@
 //! Integration tests for the module resolution system.
 
 const std = @import("std");
+const builtins = @import("builtins.zig");
 const config = @import("config.zig");
 const resolver = @import("resolver.zig");
 const types = @import("types.zig");
@@ -29,8 +30,8 @@ test "config loader parses simplified config" {
     const cfg = try loader.parseJson(json);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.modules.len);
-    try std.testing.expectEqualStrings("./src", cfg.modules[0]);
-    try std.testing.expectEqualStrings("./modules", cfg.modules[1]);
+    try std.testing.expectEqualStrings("./src", cfg.modules[0].directory);
+    try std.testing.expectEqualStrings("./modules", cfg.modules[1].directory);
     try std.testing.expectEqual(@as(usize, 1), cfg.resolvers.len);
     try std.testing.expectEqualStrings(".", cfg.resolvers[0].path.delimiter);
 }
@@ -43,7 +44,7 @@ test "path resolver resolves relative imports" {
     const path_resolver = try resolver.PathResolver.create(arena, .{
         .roots = &.{},
         .delimiter = "/",
-    }, null);
+    }, &.{}, null);
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
@@ -86,7 +87,7 @@ test "path resolver with delimiter converts dots to slashes" {
     const path_resolver = try resolver.PathResolver.create(arena, .{
         .roots = &.{"./src"},
         .delimiter = ".",
-    }, "/tmp/test");
+    }, &.{}, "/tmp/test");
 
     const request = ResolveRequest{
         .importer_uri = "file:///tmp/test/src/main.wren",
@@ -138,4 +139,115 @@ test "parser finds both classes and top-level vars" {
     try std.testing.expectEqualStrings("MyClass", class_names.items[0]);
     try std.testing.expectEqualStrings("myVar", var_names.items[0]);
     try std.testing.expectEqualStrings("anotherVar", var_names.items[1]);
+}
+
+test "builtin resolver resolves random module" {
+    const allocator = std.testing.allocator;
+    const builtin_resolver = try resolver.BuiltinResolver.create(allocator);
+    defer builtin_resolver.deinit(allocator);
+
+    const request = ResolveRequest{
+        .importer_uri = "file:///tmp/test/main.wren",
+        .import_string = "random",
+        .project_root = "/tmp/test",
+    };
+
+    const result = builtin_resolver.resolve(allocator, request);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("wren://builtin/random", result.?.canonical_id);
+    try std.testing.expect(result.?.source != null);
+    try std.testing.expect(result.?.kind == .virtual);
+    try std.testing.expect(std.mem.indexOf(u8, result.?.source.?, "foreign class Random") != null);
+
+    allocator.free(result.?.canonical_id);
+    if (result.?.uri) |uri| allocator.free(uri);
+}
+
+test "builtin resolver resolves meta module" {
+    const allocator = std.testing.allocator;
+    const builtin_resolver = try resolver.BuiltinResolver.create(allocator);
+    defer builtin_resolver.deinit(allocator);
+
+    const request = ResolveRequest{
+        .importer_uri = "file:///tmp/test/main.wren",
+        .import_string = "meta",
+        .project_root = "/tmp/test",
+    };
+
+    const result = builtin_resolver.resolve(allocator, request);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("wren://builtin/meta", result.?.canonical_id);
+    try std.testing.expect(result.?.source != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.?.source.?, "class Meta") != null);
+
+    allocator.free(result.?.canonical_id);
+    if (result.?.uri) |uri| allocator.free(uri);
+}
+
+test "builtin resolver returns null for unknown modules" {
+    const allocator = std.testing.allocator;
+    const builtin_resolver = try resolver.BuiltinResolver.create(allocator);
+    defer builtin_resolver.deinit(allocator);
+
+    const request = ResolveRequest{
+        .importer_uri = "file:///tmp/test/main.wren",
+        .import_string = "unknown_module",
+        .project_root = "/tmp/test",
+    };
+
+    const result = builtin_resolver.resolve(allocator, request);
+    try std.testing.expect(result == null);
+}
+
+test "builtin resolver ignores relative imports" {
+    const allocator = std.testing.allocator;
+    const builtin_resolver = try resolver.BuiltinResolver.create(allocator);
+    defer builtin_resolver.deinit(allocator);
+
+    const request = ResolveRequest{
+        .importer_uri = "file:///tmp/test/main.wren",
+        .import_string = "./random",
+        .project_root = "/tmp/test",
+    };
+
+    const result = builtin_resolver.resolve(allocator, request);
+    try std.testing.expect(result == null);
+}
+
+test "resolver chain includes builtin resolver" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cfg = types.Config{
+        .modules = &.{},
+        .resolvers = &.{},
+        .project_root = "/tmp/test",
+    };
+
+    var chain = try ResolverChain.init(arena, cfg);
+    defer chain.deinit();
+
+    const request = ResolveRequest{
+        .importer_uri = "file:///tmp/test/main.wren",
+        .import_string = "random",
+        .project_root = "/tmp/test",
+    };
+
+    const result = chain.resolve(request);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("wren://builtin/random", result.?.canonical_id);
+    try std.testing.expect(result.?.source != null);
+}
+
+test "getBuiltinSource returns embedded sources" {
+    try std.testing.expect(builtins.getBuiltinSource("random") != null);
+    try std.testing.expect(builtins.getBuiltinSource("meta") != null);
+    try std.testing.expect(builtins.getBuiltinSource("nonexistent") == null);
+
+    const random_src = builtins.getBuiltinSource("random").?;
+    try std.testing.expect(std.mem.indexOf(u8, random_src, "foreign class Random") != null);
+
+    const meta_src = builtins.getBuiltinSource("meta").?;
+    try std.testing.expect(std.mem.indexOf(u8, meta_src, "class Meta") != null);
 }

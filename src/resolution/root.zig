@@ -6,6 +6,7 @@
 pub const types = @import("types.zig");
 pub const config = @import("config.zig");
 pub const resolver = @import("resolver.zig");
+pub const builtins = @import("builtins.zig");
 
 pub const Config = types.Config;
 pub const ConfigLoader = config.ConfigLoader;
@@ -19,4 +20,5 @@ pub const ModuleEntry = types.ModuleEntry;
 test {
     _ = @import("test_resolution.zig");
     _ = config;
+    _ = builtins;
 }
