@@ -3842,13 +3842,65 @@ pub const Handler = struct {
 
             const token_type = tokenTagToSemanticType(token.type) orelse continue;
 
-            const line_num = doc.source_file.lineAt(token.start);
-            const line: u32 = if (line_num > 0) @intCast(line_num - 1) else 0;
-            const col_num = doc.source_file.columnAt(token.start);
-            const col: u32 = if (col_num > 0) @intCast(col_num - 1) else 0;
+            const start_line_num = doc.source_file.lineAt(token.start);
+            const start_line: u32 = if (start_line_num > 0) @intCast(start_line_num - 1) else 0;
+            const start_col_num = doc.source_file.columnAt(token.start);
+            const start_col: u32 = if (start_col_num > 0) @intCast(start_col_num - 1) else 0;
 
-            const delta_line = line - prev_line;
-            const delta_col = if (delta_line == 0) col - prev_col else col;
+            const can_be_multiline = token.type == .string or token.type == .interpolation;
+
+            if (can_be_multiline) {
+                const end_offset = token.start + token.length;
+                const token_text = doc.source_file.code[token.start..end_offset];
+                var line_start: usize = 0;
+                var current_line = start_line;
+                var is_multiline = false;
+
+                for (token_text, 0..) |ch, i| {
+                    if (ch == '\n') {
+                        is_multiline = true;
+                        const seg_len: u32 = @intCast(i - line_start);
+                        const seg_col: u32 = if (current_line == start_line) start_col else 0;
+
+                        const delta_line = current_line - prev_line;
+                        const delta_col = if (delta_line == 0) seg_col - prev_col else seg_col;
+
+                        try data.append(arena, delta_line);
+                        try data.append(arena, delta_col);
+                        try data.append(arena, seg_len);
+                        try data.append(arena, @intFromEnum(token_type));
+                        try data.append(arena, 0);
+
+                        prev_line = current_line;
+                        prev_col = seg_col;
+                        current_line += 1;
+                        line_start = i + 1;
+                    }
+                }
+
+                if (is_multiline) {
+                    if (line_start < token_text.len) {
+                        const seg_len: u32 = @intCast(token_text.len - line_start);
+                        const seg_col: u32 = 0;
+
+                        const delta_line = current_line - prev_line;
+                        const delta_col = if (delta_line == 0) seg_col - prev_col else seg_col;
+
+                        try data.append(arena, delta_line);
+                        try data.append(arena, delta_col);
+                        try data.append(arena, seg_len);
+                        try data.append(arena, @intFromEnum(token_type));
+                        try data.append(arena, 0);
+
+                        prev_line = current_line;
+                        prev_col = seg_col;
+                    }
+                    continue;
+                }
+            }
+
+            const delta_line = start_line - prev_line;
+            const delta_col = if (delta_line == 0) start_col - prev_col else start_col;
 
             try data.append(arena, delta_line);
             try data.append(arena, delta_col);
@@ -3856,8 +3908,8 @@ pub const Handler = struct {
             try data.append(arena, @intFromEnum(token_type));
             try data.append(arena, 0);
 
-            prev_line = line;
-            prev_col = col;
+            prev_line = start_line;
+            prev_col = start_col;
         }
 
         return .{ .data = data.items };

@@ -350,11 +350,13 @@ fn persistResolvedClass(self: *Resolver, class_name: []const u8) void {
         }
     }
 
-    if (self.resolved_classes.fetchPut(self.allocator, class_name, info)) |old_kv| {
+    const result = self.resolved_classes.fetchPut(self.allocator, class_name, info) catch {
+        info.deinit(self.allocator);
+        return;
+    };
+    if (result) |old_kv| {
         var old = old_kv.value;
         old.deinit(self.allocator);
-    } else |_| {
-        info.deinit(self.allocator);
     }
 }
 
