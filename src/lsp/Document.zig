@@ -39,7 +39,7 @@ pub const ExportInfo = struct {
 
 module: ast.Module,
 bytes: []const u8,
-src: []const u8,
+src: [:0]const u8,
 language: lsp_namespace.Language,
 source_file: *SourceFile,
 reporter: Reporter,
@@ -74,7 +74,7 @@ pub fn deinit(doc: *Document, gpa: std.mem.Allocator) void {
 
 pub fn init(
     gpa: std.mem.Allocator,
-    src: []const u8,
+    src: [:0]const u8,
     language: lsp_namespace.Language,
 ) !Document {
     return initWithImportSymbols(gpa, src, language, null);
@@ -82,7 +82,7 @@ pub fn init(
 
 pub fn initWithImportSymbols(
     gpa: std.mem.Allocator,
-    src: []const u8,
+    src: [:0]const u8,
     language: lsp_namespace.Language,
     import_symbols: ?*const std.StringHashMapUnmanaged(ImportSymbolInfo),
 ) !Document {

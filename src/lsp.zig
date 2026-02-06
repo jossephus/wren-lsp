@@ -722,7 +722,8 @@ pub const Handler = struct {
 
         if (chain.resolve(request)) |result| {
             if (result.source) |source| {
-                const virtual_doc = Document.init(arena, source, .wren) catch return null;
+                const source_z = arena.dupeZ(u8, source) catch return null;
+                const virtual_doc = Document.init(arena, source_z, .wren) catch return null;
                 return virtual_doc.module;
             }
         }
