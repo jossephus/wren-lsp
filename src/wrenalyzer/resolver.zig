@@ -41,21 +41,35 @@ const PendingFieldRef = struct {
     kind: Scope.Symbol.Kind,
 };
 
-const FieldTable = struct {
-    instance: std.StringHashMapUnmanaged(Token) = .empty,
-    static: std.StringHashMapUnmanaged(Token) = .empty,
+const MethodTokenList = std.ArrayListUnmanaged(Token);
+
+const ClassTable = struct {
+    instance_fields: std.StringHashMapUnmanaged(Token) = .empty,
+    static_fields: std.StringHashMapUnmanaged(Token) = .empty,
+    instance_methods: std.StringHashMapUnmanaged(MethodTokenList) = .empty,
+    static_methods: std.StringHashMapUnmanaged(MethodTokenList) = .empty,
     pending: std.ArrayListUnmanaged(PendingFieldRef) = .empty,
 
-    fn deinit(self: *FieldTable, allocator: std.mem.Allocator) void {
-        self.instance.deinit(allocator);
-        self.static.deinit(allocator);
+    fn deinit(self: *ClassTable, allocator: std.mem.Allocator) void {
+        self.instance_fields.deinit(allocator);
+        self.static_fields.deinit(allocator);
+        var im_iter = self.instance_methods.iterator();
+        while (im_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.instance_methods.deinit(allocator);
+        var sm_iter = self.static_methods.iterator();
+        while (sm_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.static_methods.deinit(allocator);
         self.pending.deinit(allocator);
     }
 
-    fn fieldMap(self: *FieldTable, kind: Scope.Symbol.Kind) ?*std.StringHashMapUnmanaged(Token) {
+    fn fieldMap(self: *ClassTable, kind: Scope.Symbol.Kind) ?*std.StringHashMapUnmanaged(Token) {
         return switch (kind) {
-            .field => &self.instance,
-            .static_field => &self.static,
+            .field => &self.instance_fields,
+            .static_field => &self.static_fields,
             else => null,
         };
     }
@@ -68,7 +82,8 @@ class_depth: usize,
 module: ?*ast.Module,
 refs_out: ?*std.ArrayListUnmanaged(ResolvedRef) = null,
 import_symbols: ?*const std.StringHashMapUnmanaged(ImportSymbolInfo) = null,
-class_fields: std.ArrayListUnmanaged(FieldTable) = .empty,
+class_tables: std.ArrayListUnmanaged(ClassTable) = .empty,
+in_static_method: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -81,10 +96,10 @@ pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
 }
 
 pub fn deinit(self: *Resolver) void {
-    for (self.class_fields.items) |*ft| {
-        ft.deinit(self.allocator);
+    for (self.class_tables.items) |*ct| {
+        ct.deinit(self.allocator);
     }
-    self.class_fields.deinit(self.allocator);
+    self.class_tables.deinit(self.allocator);
     self.scope.deinit();
 }
 
@@ -127,33 +142,65 @@ fn resolveNode(self: *Resolver, node: *const ast.Node) void {
 
 fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
     if (stmt.name) |name| {
-        // Find constructor arity (use first constructor found, or null if none)
         const ctor_arity = self.findConstructorArity(stmt.methods);
         self.scope.declareWithType(name, .class, .class_type, ctor_arity, null);
     }
 
     self.scope.beginClass();
     self.class_depth += 1;
-    const pushed = if (self.class_fields.append(self.allocator, .{})) |_| true else |_| false;
+    const pushed = if (self.class_tables.append(self.allocator, .{})) |_| true else |_| false;
+
+    if (pushed) {
+        self.populateMethodTable(stmt.methods);
+    }
 
     for (stmt.methods) |*method| {
         self.resolveNode(method);
     }
 
     if (pushed) {
-        var ft = self.class_fields.pop() orelse unreachable;
-        self.fixupPendingFieldRefs(&ft);
-        ft.deinit(self.allocator);
+        var ct = self.class_tables.pop() orelse unreachable;
+        self.fixupPendingFieldRefs(&ct);
+        ct.deinit(self.allocator);
     }
     self.class_depth -= 1;
     self.scope.endClass();
 }
 
-fn trackFieldRef(self: *Resolver, name_tok: Token, kind: Scope.Symbol.Kind, is_write: bool) void {
-    if (self.class_fields.items.len == 0) return;
-    const ft = &self.class_fields.items[self.class_fields.items.len - 1];
+fn populateMethodTable(self: *Resolver, methods: []ast.Node) void {
+    if (self.class_tables.items.len == 0) return;
+    const ct = &self.class_tables.items[self.class_tables.items.len - 1];
 
-    const map = ft.fieldMap(kind) orelse return;
+    for (methods) |method_node| {
+        switch (method_node) {
+            .Method => |method| {
+                const name_tok = method.name orelse continue;
+                const is_static = method.staticKeyword != null or method.constructKeyword != null;
+                const map = if (is_static) &ct.static_methods else &ct.instance_methods;
+                const gop = map.getOrPut(self.allocator, name_tok.name()) catch continue;
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+                gop.value_ptr.append(self.allocator, name_tok) catch {};
+                if (self.refs_out) |refs| {
+                    refs.append(self.allocator, .{
+                        .use_token = name_tok,
+                        .decl_token = name_tok,
+                        .kind = .method,
+                        .is_write = true,
+                    }) catch {};
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn trackFieldRef(self: *Resolver, name_tok: Token, kind: Scope.Symbol.Kind, is_write: bool) void {
+    if (self.class_tables.items.len == 0) return;
+    const ct = &self.class_tables.items[self.class_tables.items.len - 1];
+
+    const map = ct.fieldMap(kind) orelse return;
     const field_name = name_tok.name();
 
     if (is_write) {
@@ -188,7 +235,7 @@ fn trackFieldRef(self: *Resolver, name_tok: Token, kind: Scope.Symbol.Kind, is_w
                     .kind = kind,
                     .is_write = false,
                 }) catch return;
-                ft.pending.append(self.allocator, .{
+                ct.pending.append(self.allocator, .{
                     .ref_index = ref_index,
                     .field_name = field_name,
                     .kind = kind,
@@ -198,10 +245,39 @@ fn trackFieldRef(self: *Resolver, name_tok: Token, kind: Scope.Symbol.Kind, is_w
     }
 }
 
-fn fixupPendingFieldRefs(self: *Resolver, ft: *FieldTable) void {
+fn trackMethodRef(self: *Resolver, name_tok: Token) void {
+    if (self.class_tables.items.len == 0) return;
+    const ct = &self.class_tables.items[self.class_tables.items.len - 1];
+    const method_name = name_tok.name();
+
+    const map = if (self.in_static_method) &ct.static_methods else &ct.instance_methods;
+    const token_list = map.get(method_name) orelse {
+        if (self.refs_out) |refs| {
+            refs.append(self.allocator, .{
+                .use_token = name_tok,
+                .decl_token = name_tok,
+                .kind = .method,
+                .is_write = false,
+            }) catch {};
+        }
+        return;
+    };
+    if (token_list.items.len == 0) return;
+    const decl_tok = token_list.items[0];
+    if (self.refs_out) |refs| {
+        refs.append(self.allocator, .{
+            .use_token = name_tok,
+            .decl_token = decl_tok,
+            .kind = .method,
+            .is_write = false,
+        }) catch {};
+    }
+}
+
+fn fixupPendingFieldRefs(self: *Resolver, ct: *ClassTable) void {
     const refs = self.refs_out orelse return;
-    for (ft.pending.items) |pending| {
-        const map = ft.fieldMap(pending.kind) orelse continue;
+    for (ct.pending.items) |pending| {
+        const map = ct.fieldMap(pending.kind) orelse continue;
         if (map.get(pending.field_name)) |decl_tok| {
             if (pending.ref_index < refs.items.len) {
                 refs.items[pending.ref_index].decl_token = decl_tok;
@@ -209,17 +285,15 @@ fn fixupPendingFieldRefs(self: *Resolver, ft: *FieldTable) void {
         }
     }
 
-    // Second pass: for read-only fields with no declaration, promote the
-    // first read to a pseudo-declaration and patch the rest to point to it.
-    for (ft.pending.items) |pending| {
-        const map = ft.fieldMap(pending.kind) orelse continue;
+    for (ct.pending.items) |pending| {
+        const map = ct.fieldMap(pending.kind) orelse continue;
         if (map.get(pending.field_name) != null) continue;
         if (pending.ref_index >= refs.items.len) continue;
 
         const pseudo_decl = refs.items[pending.ref_index].use_token;
         map.put(self.allocator, pending.field_name, pseudo_decl) catch continue;
 
-        for (ft.pending.items) |other| {
+        for (ct.pending.items) |other| {
             if (other.kind != pending.kind) continue;
             if (!std.mem.eql(u8, other.field_name, pending.field_name)) continue;
             if (other.ref_index >= refs.items.len) continue;
@@ -244,6 +318,10 @@ fn findConstructorArity(self: *Resolver, methods: []ast.Node) ?usize {
 }
 
 fn visitMethod(self: *Resolver, method: ast.Method) void {
+    const prev_static = self.in_static_method;
+    self.in_static_method = method.staticKeyword != null;
+    defer self.in_static_method = prev_static;
+
     if (method.body.*) |*body| {
         self.resolveNode(body);
     }
@@ -420,18 +498,18 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
         self.checkBuiltinCallArity(recv, expr);
         self.checkUserMethodArity(recv, expr);
 
-        // Track method name as a reference (for hover/goto on method names)
-        // Method names don't have a declaration we can resolve, but we track them
-        // so hover shows something useful
-        if (self.refs_out) |refs| {
+        if (recv.* == .ThisExpr and self.class_tables.items.len > 0) {
+            self.trackMethodRef(expr.name);
+        } else if (self.refs_out) |refs| {
             refs.append(self.allocator, .{
                 .use_token = expr.name,
-                .decl_token = expr.name, // Point to itself since no actual decl
+                .decl_token = expr.name,
                 .kind = .method,
                 .is_write = false,
             }) catch {};
         }
     } else {
+        const in_class = self.class_tables.items.len > 0;
         if (self.scope.resolveOptional(expr.name)) |sym| {
             if (!sym.is_builtin) {
                 if (self.refs_out) |refs| {
@@ -443,8 +521,10 @@ fn visitCallExpr(self: *Resolver, expr: ast.CallExpr) void {
                     }) catch {};
                 }
             }
+            if (in_class) self.trackMethodRef(expr.name);
+        } else if (in_class) {
+            self.trackMethodRef(expr.name);
         } else {
-            // Report undefined symbol errors both at top-level and inside classes
             _ = self.scope.resolve(expr.name);
         }
     }
