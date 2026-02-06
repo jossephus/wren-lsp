@@ -459,7 +459,11 @@ fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
     self.ignoreLine();
 
     while (self.match(Tag.rightBrace) == null and self.peek() != Tag.eof) {
-        methods.append(self.alloc(), self.method()) catch @panic("Error allocating memory");
+        if (self.peek() == Tag.field or self.peek() == Tag.staticField) {
+            methods.append(self.alloc(), self.definition()) catch @panic("Error allocating memory");
+        } else {
+            methods.append(self.alloc(), self.method()) catch @panic("Error allocating memory");
+        }
 
         if (self.match(Tag.rightBrace) != null) break;
 

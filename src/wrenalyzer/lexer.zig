@@ -58,7 +58,7 @@ fn readField(self: *Lexer) !Token {
         tag = Tag.staticField;
     }
 
-    while (!self.isAtEnd() and std.ascii.isAlphanumeric(self.source.code[self.current])) {
+    while (!self.isAtEnd() and isIdentifierBodyChar(self.source.code[self.current])) {
         self.advance();
     }
 
@@ -297,7 +297,7 @@ fn makeToken(self: *Lexer, tag: Tag) Token {
 }
 
 fn readName(self: *Lexer) !Token {
-    while (!self.isAtEnd() and (std.ascii.isAlphanumeric(self.source.code[self.current]) or self.source.code[self.current] == '_')) {
+    while (!self.isAtEnd() and isIdentifierBodyChar(self.source.code[self.current])) {
         self.advance();
     }
 
@@ -308,6 +308,10 @@ fn readName(self: *Lexer) !Token {
         @"type" = KeyWords.get(text).?;
     }
     return Token.new(self.source, @"type", self.start, self.current - self.start);
+}
+
+fn isIdentifierBodyChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 fn match(self: *Lexer, c: Chars) bool {
@@ -391,7 +395,7 @@ test "lexer handles hex numbers without panic" {
 
 test "lexer handles fields without panic" {
     const allocator = std.testing.allocator;
-    const src = "_field _staticField";
+    const src = "_field __staticField";
     var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
     var lexer = try Lexer.new(allocator, &source_file);
     defer lexer.deinit();
@@ -402,6 +406,38 @@ test "lexer handles fields without panic" {
 
     const tok2 = try lexer.readToken();
     try std.testing.expectEqual(Tag.staticField, tok2.type);
+}
+
+test "lexer keeps underscores inside field names" {
+    const allocator = std.testing.allocator;
+    const src = "_a_b";
+    var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, &source_file);
+    defer lexer.deinit();
+    defer source_file.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.field, tok1.type);
+    try std.testing.expectEqualStrings("_a_b", tok1.name());
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.eof, tok2.type);
+}
+
+test "lexer allows variable identifier chars in fields" {
+    const allocator = std.testing.allocator;
+    const src = "_foo1_bar2";
+    var source_file = try @import("source_file.zig").new(allocator, "test.wren", src);
+    var lexer = try Lexer.new(allocator, &source_file);
+    defer lexer.deinit();
+    defer source_file.deinit();
+
+    const tok1 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.field, tok1.type);
+    try std.testing.expectEqualStrings("_foo1_bar2", tok1.name());
+
+    const tok2 = try lexer.readToken();
+    try std.testing.expectEqual(Tag.eof, tok2.type);
 }
 
 test "lexer handles source ending with identifier" {
