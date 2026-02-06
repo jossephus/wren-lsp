@@ -369,3 +369,56 @@ test "Document with import symbols uses provided type info" {
     }
     try std.testing.expect(found_arity_error);
 }
+
+test "super.method() resolves to parent class method declaration" {
+    const src =
+        \\class Animal {
+        \\  construct new() {}
+        \\  speak() { return "..." }
+        \\  move(x) { return x }
+        \\}
+        \\class Dog is Animal {
+        \\  construct new() {}
+        \\  speak() {
+        \\    super.speak()
+        \\    return "woof"
+        \\  }
+        \\  move(x) {
+        \\    super.move(x)
+        \\  }
+        \\}
+    ;
+
+    var doc = try Document.init(std.testing.allocator, src, .wren);
+    defer doc.deinit(std.testing.allocator);
+
+    var super_speak_ref: ?ResolvedRef = null;
+    var super_move_ref: ?ResolvedRef = null;
+    for (doc.refs.items) |ref| {
+        if (ref.use_token.start >= src.len) continue;
+        const use_name = src[ref.use_token.start..][0..ref.use_token.length];
+        if (std.mem.eql(u8, use_name, "speak") and !ref.is_write) {
+            if (ref.use_token.start != ref.decl_token.start) {
+                super_speak_ref = ref;
+            }
+        }
+        if (std.mem.eql(u8, use_name, "move") and !ref.is_write) {
+            if (ref.use_token.start != ref.decl_token.start) {
+                super_move_ref = ref;
+            }
+        }
+    }
+
+    // super.speak() should resolve to Animal's speak method declaration
+    try std.testing.expect(super_speak_ref != null);
+    const speak_decl_name = src[super_speak_ref.?.decl_token.start..][0..super_speak_ref.?.decl_token.length];
+    try std.testing.expectEqualStrings("speak", speak_decl_name);
+    // The decl should be in Animal (before Dog's definition)
+    try std.testing.expect(super_speak_ref.?.decl_token.start < super_speak_ref.?.use_token.start);
+
+    // super.move() should resolve to Animal's move method declaration
+    try std.testing.expect(super_move_ref != null);
+    const move_decl_name = src[super_move_ref.?.decl_token.start..][0..super_move_ref.?.decl_token.length];
+    try std.testing.expectEqualStrings("move", move_decl_name);
+    try std.testing.expect(super_move_ref.?.decl_token.start < super_move_ref.?.use_token.start);
+}

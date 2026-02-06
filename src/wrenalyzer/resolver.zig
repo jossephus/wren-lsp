@@ -43,6 +43,16 @@ const PendingFieldRef = struct {
 
 const MethodTokenList = std.ArrayListUnmanaged(Token);
 
+const ResolvedClassInfo = struct {
+    instance_methods: std.StringHashMapUnmanaged(Token) = .empty,
+    static_methods: std.StringHashMapUnmanaged(Token) = .empty,
+
+    fn deinit(self: *ResolvedClassInfo, allocator: std.mem.Allocator) void {
+        self.instance_methods.deinit(allocator);
+        self.static_methods.deinit(allocator);
+    }
+};
+
 const ClassTable = struct {
     instance_fields: std.StringHashMapUnmanaged(Token) = .empty,
     static_fields: std.StringHashMapUnmanaged(Token) = .empty,
@@ -83,7 +93,10 @@ module: ?*ast.Module,
 refs_out: ?*std.ArrayListUnmanaged(ResolvedRef) = null,
 import_symbols: ?*const std.StringHashMapUnmanaged(ImportSymbolInfo) = null,
 class_tables: std.ArrayListUnmanaged(ClassTable) = .empty,
+resolved_classes: std.StringHashMapUnmanaged(ResolvedClassInfo) = .empty,
+superclass_stack: std.ArrayListUnmanaged(?[]const u8) = .empty,
 in_static_method: bool = false,
+in_constructor: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -100,6 +113,12 @@ pub fn deinit(self: *Resolver) void {
         ct.deinit(self.allocator);
     }
     self.class_tables.deinit(self.allocator);
+    var rc_iter = self.resolved_classes.iterator();
+    while (rc_iter.next()) |entry| {
+        entry.value_ptr.deinit(self.allocator);
+    }
+    self.resolved_classes.deinit(self.allocator);
+    self.superclass_stack.deinit(self.allocator);
     self.scope.deinit();
 }
 
@@ -146,6 +165,12 @@ fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
         self.scope.declareWithType(name, .class, .class_type, ctor_arity, null);
     }
 
+    const superclass_name: ?[]const u8 = if (stmt.superclass) |sc| sc.name() else null;
+    const sc_pushed = if (self.superclass_stack.append(self.allocator, superclass_name)) |_| true else |_| false;
+    defer if (sc_pushed) {
+        _ = self.superclass_stack.pop();
+    };
+
     self.scope.beginClass();
     self.class_depth += 1;
     const pushed = if (self.class_tables.append(self.allocator, .{})) |_| true else |_| false;
@@ -159,6 +184,9 @@ fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
     }
 
     if (pushed) {
+        if (stmt.name) |name| {
+            self.persistResolvedClass(name.name());
+        }
         var ct = self.class_tables.pop() orelse unreachable;
         self.fixupPendingFieldRefs(&ct);
         ct.deinit(self.allocator);
@@ -302,6 +330,34 @@ fn fixupPendingFieldRefs(self: *Resolver, ct: *ClassTable) void {
     }
 }
 
+fn persistResolvedClass(self: *Resolver, class_name: []const u8) void {
+    if (self.class_tables.items.len == 0) return;
+    const ct = &self.class_tables.items[self.class_tables.items.len - 1];
+
+    var info: ResolvedClassInfo = .{};
+
+    var im_iter = ct.instance_methods.iterator();
+    while (im_iter.next()) |entry| {
+        if (entry.value_ptr.items.len > 0) {
+            info.instance_methods.put(self.allocator, entry.key_ptr.*, entry.value_ptr.items[0]) catch {};
+        }
+    }
+
+    var sm_iter = ct.static_methods.iterator();
+    while (sm_iter.next()) |entry| {
+        if (entry.value_ptr.items.len > 0) {
+            info.static_methods.put(self.allocator, entry.key_ptr.*, entry.value_ptr.items[0]) catch {};
+        }
+    }
+
+    if (self.resolved_classes.fetchPut(self.allocator, class_name, info)) |old_kv| {
+        var old = old_kv.value;
+        old.deinit(self.allocator);
+    } else |_| {
+        info.deinit(self.allocator);
+    }
+}
+
 fn findConstructorArity(self: *Resolver, methods: []ast.Node) ?usize {
     _ = self;
     for (methods) |method_node| {
@@ -319,8 +375,13 @@ fn findConstructorArity(self: *Resolver, methods: []ast.Node) ?usize {
 
 fn visitMethod(self: *Resolver, method: ast.Method) void {
     const prev_static = self.in_static_method;
+    const prev_ctor = self.in_constructor;
     self.in_static_method = method.staticKeyword != null;
-    defer self.in_static_method = prev_static;
+    self.in_constructor = method.constructKeyword != null;
+    defer {
+        self.in_static_method = prev_static;
+        self.in_constructor = prev_ctor;
+    }
 
     if (method.body.*) |*body| {
         self.resolveNode(body);
@@ -903,6 +964,54 @@ fn visitSuperExpr(self: *Resolver, expr: ast.SuperExpr) void {
     if (expr.blockArgument.*) |*block| {
         self.resolveNode(block);
     }
+
+    const name_tok = expr.name orelse return;
+    const refs = self.refs_out orelse return;
+
+    const parent_name = self.currentSuperclass() orelse {
+        refs.append(self.allocator, .{
+            .use_token = name_tok,
+            .decl_token = name_tok,
+            .kind = .method,
+            .is_write = false,
+        }) catch {};
+        return;
+    };
+
+    if (self.resolveSuperMethodToken(parent_name, name_tok.name())) |decl_tok| {
+        refs.append(self.allocator, .{
+            .use_token = name_tok,
+            .decl_token = decl_tok,
+            .kind = .method,
+            .is_write = false,
+        }) catch {};
+        return;
+    }
+
+    refs.append(self.allocator, .{
+        .use_token = name_tok,
+        .decl_token = name_tok,
+        .kind = .method,
+        .is_write = false,
+    }) catch {};
+}
+
+fn currentSuperclass(self: *const Resolver) ?[]const u8 {
+    if (self.superclass_stack.items.len == 0) return null;
+    return self.superclass_stack.items[self.superclass_stack.items.len - 1];
+}
+
+fn resolveSuperMethodToken(self: *Resolver, parent_name: []const u8, method_name: []const u8) ?Token {
+    if (self.resolved_classes.getPtr(parent_name)) |info| {
+        // Constructors are stored in static_methods but in_static_method is false
+        const map = if (self.in_static_method or self.in_constructor)
+            &info.static_methods
+        else
+            &info.instance_methods;
+        if (map.get(method_name)) |tok| return tok;
+    }
+
+    return null;
 }
 
 pub fn extractMethodsFromAst(gpa: std.mem.Allocator, methods: []const ast.Node) ?[]const ClassMethodInfo {
