@@ -35,6 +35,32 @@ pub const ImportSymbolInfo = struct {
     methods: ?[]const ClassMethodInfo = null,
 };
 
+const PendingFieldRef = struct {
+    ref_index: usize,
+    field_name: []const u8,
+    kind: Scope.Symbol.Kind,
+};
+
+const FieldTable = struct {
+    instance: std.StringHashMapUnmanaged(Token) = .empty,
+    static: std.StringHashMapUnmanaged(Token) = .empty,
+    pending: std.ArrayListUnmanaged(PendingFieldRef) = .empty,
+
+    fn deinit(self: *FieldTable, allocator: std.mem.Allocator) void {
+        self.instance.deinit(allocator);
+        self.static.deinit(allocator);
+        self.pending.deinit(allocator);
+    }
+
+    fn fieldMap(self: *FieldTable, kind: Scope.Symbol.Kind) ?*std.StringHashMapUnmanaged(Token) {
+        return switch (kind) {
+            .field => &self.instance,
+            .static_field => &self.static,
+            else => null,
+        };
+    }
+};
+
 allocator: std.mem.Allocator,
 scope: Scope,
 reporter: *Reporter,
@@ -42,6 +68,7 @@ class_depth: usize,
 module: ?*ast.Module,
 refs_out: ?*std.ArrayListUnmanaged(ResolvedRef) = null,
 import_symbols: ?*const std.StringHashMapUnmanaged(ImportSymbolInfo) = null,
+class_fields: std.ArrayListUnmanaged(FieldTable) = .empty,
 
 pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
     return .{
@@ -54,6 +81,10 @@ pub fn init(allocator: std.mem.Allocator, reporter: *Reporter) !Resolver {
 }
 
 pub fn deinit(self: *Resolver) void {
+    for (self.class_fields.items) |*ft| {
+        ft.deinit(self.allocator);
+    }
+    self.class_fields.deinit(self.allocator);
     self.scope.deinit();
 }
 
@@ -88,7 +119,9 @@ fn resolveNode(self: *Resolver, node: *const ast.Node) void {
         .SubscriptExpr => |expr| self.visitSubscriptExpr(expr),
         .SuperExpr => |expr| self.visitSuperExpr(expr),
         .Module => {},
-        .NumExpr, .BoolExpr, .NullExpr, .StringExpr, .ThisExpr, .FieldExpr, .StaticFieldExpr => {},
+        .FieldExpr => |expr| self.trackFieldRef(expr.name, .field, false),
+        .StaticFieldExpr => |expr| self.trackFieldRef(expr.name, .static_field, false),
+        .NumExpr, .BoolExpr, .NullExpr, .StringExpr, .ThisExpr => {},
     }
 }
 
@@ -101,13 +134,98 @@ fn visitClassStmt(self: *Resolver, stmt: ast.ClassStmt) void {
 
     self.scope.beginClass();
     self.class_depth += 1;
+    const pushed = if (self.class_fields.append(self.allocator, .{})) |_| true else |_| false;
 
     for (stmt.methods) |*method| {
         self.resolveNode(method);
     }
 
+    if (pushed) {
+        var ft = self.class_fields.pop() orelse unreachable;
+        self.fixupPendingFieldRefs(&ft);
+        ft.deinit(self.allocator);
+    }
     self.class_depth -= 1;
     self.scope.endClass();
+}
+
+fn trackFieldRef(self: *Resolver, name_tok: Token, kind: Scope.Symbol.Kind, is_write: bool) void {
+    if (self.class_fields.items.len == 0) return;
+    const ft = &self.class_fields.items[self.class_fields.items.len - 1];
+
+    const map = ft.fieldMap(kind) orelse return;
+    const field_name = name_tok.name();
+
+    if (is_write) {
+        if (map.get(field_name) == null) {
+            map.put(self.allocator, field_name, name_tok) catch return;
+        }
+        const decl_tok = map.get(field_name).?;
+        if (self.refs_out) |refs| {
+            refs.append(self.allocator, .{
+                .use_token = name_tok,
+                .decl_token = decl_tok,
+                .kind = kind,
+                .is_write = true,
+            }) catch {};
+        }
+    } else {
+        if (map.get(field_name)) |decl_tok| {
+            if (self.refs_out) |refs| {
+                refs.append(self.allocator, .{
+                    .use_token = name_tok,
+                    .decl_token = decl_tok,
+                    .kind = kind,
+                    .is_write = false,
+                }) catch {};
+            }
+        } else {
+            if (self.refs_out) |refs| {
+                const ref_index = refs.items.len;
+                refs.append(self.allocator, .{
+                    .use_token = name_tok,
+                    .decl_token = name_tok,
+                    .kind = kind,
+                    .is_write = false,
+                }) catch return;
+                ft.pending.append(self.allocator, .{
+                    .ref_index = ref_index,
+                    .field_name = field_name,
+                    .kind = kind,
+                }) catch {};
+            }
+        }
+    }
+}
+
+fn fixupPendingFieldRefs(self: *Resolver, ft: *FieldTable) void {
+    const refs = self.refs_out orelse return;
+    for (ft.pending.items) |pending| {
+        const map = ft.fieldMap(pending.kind) orelse continue;
+        if (map.get(pending.field_name)) |decl_tok| {
+            if (pending.ref_index < refs.items.len) {
+                refs.items[pending.ref_index].decl_token = decl_tok;
+            }
+        }
+    }
+
+    // Second pass: for read-only fields with no declaration, promote the
+    // first read to a pseudo-declaration and patch the rest to point to it.
+    for (ft.pending.items) |pending| {
+        const map = ft.fieldMap(pending.kind) orelse continue;
+        if (map.get(pending.field_name) != null) continue;
+        if (pending.ref_index >= refs.items.len) continue;
+
+        const pseudo_decl = refs.items[pending.ref_index].use_token;
+        map.put(self.allocator, pending.field_name, pseudo_decl) catch continue;
+
+        for (ft.pending.items) |other| {
+            if (other.kind != pending.kind) continue;
+            if (!std.mem.eql(u8, other.field_name, pending.field_name)) continue;
+            if (other.ref_index >= refs.items.len) continue;
+            refs.items[other.ref_index].decl_token = pseudo_decl;
+        }
+    }
 }
 
 fn findConstructorArity(self: *Resolver, methods: []ast.Node) ?usize {
@@ -620,6 +738,14 @@ fn visitAssignmentExpr(self: *Resolver, expr: ast.AssignmentExpr) void {
 
     // Track reference to assignment target (write access)
     switch (expr.target.*) {
+        .FieldExpr => |f| {
+            self.trackFieldRef(f.name, .field, true);
+            return;
+        },
+        .StaticFieldExpr => |f| {
+            self.trackFieldRef(f.name, .static_field, true);
+            return;
+        },
         .CallExpr => |call| {
             if (call.receiver == null) {
                 if (self.scope.resolveOptional(call.name)) |sym| {

@@ -3170,38 +3170,46 @@ pub const Handler = struct {
             log.debug("rename: resolved symbol found", .{});
             var edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
 
-            // Track which declaration starts we've already added to avoid duplicates
-            var added_decl = false;
+            // Track which token starts we've already added to avoid duplicates
+            var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .{};
 
             // Find all references to this declaration
             for (doc.refs.items) |ref| {
                 if (ref.decl_token.start == resolved.decl_token.start) {
-                    try edits.append(arena, .{
-                        .range = tokenToRange(ref.use_token),
-                        .newText = params.newName,
-                    });
+                    const gop = try seen_starts.getOrPut(arena, ref.use_token.start);
+                    if (!gop.found_existing) {
+                        try edits.append(arena, .{
+                            .range = tokenToRange(ref.use_token),
+                            .newText = params.newName,
+                        });
+                    }
                 }
             }
 
-            // Also include the declaration itself (check doc.symbols first for module-level)
+            // Also include the declaration itself (check doc.symbols for module-level)
             for (doc.symbols.items) |sym| {
                 if (sym.token.start == resolved.decl_token.start) {
-                    try edits.append(arena, .{
-                        .range = tokenToRange(sym.token),
-                        .newText = params.newName,
-                    });
-                    added_decl = true;
+                    const gop = try seen_starts.getOrPut(arena, sym.token.start);
+                    if (!gop.found_existing) {
+                        try edits.append(arena, .{
+                            .range = tokenToRange(sym.token),
+                            .newText = params.newName,
+                        });
+                    }
                     break;
                 }
             }
 
-            // If declaration not found in symbols (e.g., local variable inside method),
+            // If declaration not found yet (e.g., fields or local variables inside methods),
             // add it directly from the resolved ref's decl_token
-            if (!added_decl) {
-                try edits.append(arena, .{
-                    .range = tokenToRange(resolved.decl_token),
-                    .newText = params.newName,
-                });
+            {
+                const gop = try seen_starts.getOrPut(arena, resolved.decl_token.start);
+                if (!gop.found_existing) {
+                    try edits.append(arena, .{
+                        .range = tokenToRange(resolved.decl_token),
+                        .newText = params.newName,
+                    });
+                }
             }
 
             if (edits.items.len == 0) return null;
