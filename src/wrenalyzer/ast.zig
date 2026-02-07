@@ -81,9 +81,10 @@ pub const Node = union(NodeTag) {
 
 pub const Module = struct {
     statements: []Node,
+    meta: ?*const Meta,
 
-    pub fn init(statements: []Node) Module {
-        return .{ .statements = statements };
+    pub fn init(statements: []Node, meta: ?*const Meta) Module {
+        return .{ .statements = statements, .meta = meta };
     }
 
     pub fn toString(self: *Module, buf: []u8) ![]u8 {
@@ -105,6 +106,69 @@ pub const MapEntryNode = struct {
         var fbs = std.io.fixedBufferStream(buf);
         try fbs.writer().print("{any}: {any}", .{ self.key, self.value });
         return fbs.getWritten();
+    }
+};
+
+pub const MetaGroupEntry = struct {
+    key_tok: Token,
+    value: ?Node,
+
+    pub fn init(key_tok: Token, value: ?Node) MetaGroupEntry {
+        return .{ .key_tok = key_tok, .value = value };
+    }
+};
+
+pub const MetaGroupItem = struct {
+    key: []const u8,
+    key_tok: Token,
+    entries: []const MetaGroupEntry,
+
+    pub fn init(key: []const u8, key_tok: Token, entries: []const MetaGroupEntry) MetaGroupItem {
+        return .{ .key = key, .key_tok = key_tok, .entries = entries };
+    }
+};
+
+pub const MetaGroup = struct {
+    items: []const MetaGroupItem,
+
+    pub fn init(items: []const MetaGroupItem) MetaGroup {
+        return .{ .items = items };
+    }
+};
+
+pub const MetaOccurrence = struct {
+    introducer: Token,
+    value: MetaOccurrenceValue,
+
+    pub fn init(introducer: Token, value: MetaOccurrenceValue) MetaOccurrence {
+        return .{ .introducer = introducer, .value = value };
+    }
+};
+
+pub const MetaOccurrenceValue = union(enum) {
+    none,
+    expr: Node,
+    group: MetaGroup,
+};
+
+pub const MetaAttr = struct {
+    name_tok: Token,
+    occurrences: []const MetaOccurrence,
+
+    pub fn init(name_tok: Token, occurrences: []const MetaOccurrence) MetaAttr {
+        return .{ .name_tok = name_tok, .occurrences = occurrences };
+    }
+};
+
+pub const Meta = struct {
+    attrs: []const MetaAttr,
+
+    pub fn init(attrs: []const MetaAttr) Meta {
+        return .{ .attrs = attrs };
+    }
+
+    pub fn isEmpty(self: *const Meta) bool {
+        return self.attrs.len == 0;
     }
 };
 
@@ -131,12 +195,13 @@ pub const Method = struct {
     name: ?Token,
     parameters: []Token,
     body: *?Node,
+    meta: ?*const Meta,
 
-    pub fn init(foreign: ?Token, static: ?Token, construct: ?Token, name: ?Token, parameters: []Token, body: *?Node) Method {
-        return .{ .foreignKeyword = foreign, .staticKeyword = static, .constructKeyword = construct, .name = name, .parameters = parameters, .body = body };
+    pub fn init(foreign: ?Token, static: ?Token, construct: ?Token, name: ?Token, parameters: []Token, body: *?Node, meta: ?*const Meta) Method {
+        return .{ .foreignKeyword = foreign, .staticKeyword = static, .constructKeyword = construct, .name = name, .parameters = parameters, .body = body, .meta = meta };
     }
 
-    pub fn toString(self: ListExpr, buf: []u8) ![]u8 {
+    pub fn toString(self: Method, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
         try fbs.writer().print("{any} {any} Method:{any}({any}) {any}", .{ self.foreignKeyword, self.staticKeyword, self.name, self.parameters, self.body });
         return fbs.getWritten();
@@ -502,9 +567,10 @@ pub const BlockStmt = struct {
 pub const VarStmt = struct {
     name: ?Token,
     initializer: *?Node,
+    meta: ?*const Meta,
 
-    pub fn init(name: ?Token, initializer: *?Node) VarStmt {
-        return .{ .name = name, .initializer = initializer };
+    pub fn init(name: ?Token, initializer: *?Node, meta: ?*const Meta) VarStmt {
+        return .{ .name = name, .initializer = initializer, .meta = meta };
     }
 
     pub fn toString(self: VarStmt, buf: []u8) ![]u8 {
@@ -593,18 +659,21 @@ pub const ClassStmt = struct {
     name: ?Token,
     superclass: ?Token,
     methods: []Node,
+    vars: []Node,
+    meta: ?*const Meta,
 
-    pub fn init(foreign: ?Token, name: ?Token, superclass: ?Token, methods: []Node) ClassStmt {
-        return .{ .foreignKeyword = foreign, .name = name, .superclass = superclass, .methods = methods };
+    pub fn init(foreign: ?Token, name: ?Token, superclass: ?Token, methods: []Node, vars: []Node, meta: ?*const Meta) ClassStmt {
+        return .{ .foreignKeyword = foreign, .name = name, .superclass = superclass, .methods = methods, .vars = vars, .meta = meta };
     }
 
     pub fn toString(self: ClassStmt, buf: []u8) ![]u8 {
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Class({any} {any} {any} {any})", .{
+        try fbs.writer().print("Class({any} {any} {any} {any} {any})", .{
             self.foreignKeyword,
             self.name,
             self.superclass,
             self.methods,
+            self.vars,
         });
         return fbs.getWritten();
     }

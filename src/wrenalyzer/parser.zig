@@ -14,6 +14,12 @@ pub const Error = struct {
     token: token.Token,
 };
 
+const PendingAttr = struct {
+    name_tok: Token,
+    name_text: []const u8,
+    occurrences: std.ArrayListUnmanaged(ast.MetaOccurrence),
+};
+
 lexer: Lexer,
 allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
@@ -22,6 +28,7 @@ next: ?Token,
 previous: ?Token,
 errors: std.ArrayListUnmanaged(Error),
 reporter: ?*Reporter,
+pending_meta_names: std.ArrayListUnmanaged(PendingAttr),
 
 pub fn new(allocator: std.mem.Allocator, lexer: Lexer) !Parser {
     return newWithReporter(allocator, lexer, null);
@@ -37,6 +44,7 @@ pub fn newWithReporter(allocator: std.mem.Allocator, lexer: Lexer, reporter: ?*R
         .previous = null,
         .errors = .empty,
         .reporter = reporter,
+        .pending_meta_names = .empty,
     };
 }
 
@@ -50,7 +58,148 @@ fn alloc(self: *Parser) std.mem.Allocator {
     return self.arena.allocator();
 }
 
+fn takeMeta(self: *Parser) ?*const ast.Meta {
+    if (self.pending_meta_names.items.len == 0) return null;
+
+    var attrs: std.ArrayListUnmanaged(ast.MetaAttr) = .empty;
+    for (self.pending_meta_names.items) |*pa| {
+        attrs.append(self.alloc(), ast.MetaAttr.init(
+            pa.name_tok,
+            pa.occurrences.toOwnedSlice(self.alloc()) catch &.{},
+        )) catch {};
+    }
+
+    const meta = self.alloc().create(ast.Meta) catch return null;
+    meta.* = ast.Meta.init(attrs.toOwnedSlice(self.alloc()) catch &.{});
+    self.pending_meta_names.clearRetainingCapacity();
+    return meta;
+}
+
+fn findOrAddPendingAttr(self: *Parser, name_tok: Token) *PendingAttr {
+    const name_text = name_tok.name();
+    for (self.pending_meta_names.items) |*attr| {
+        if (std.mem.eql(u8, attr.name_text, name_text)) return attr;
+    }
+    self.pending_meta_names.append(self.alloc(), .{
+        .name_tok = name_tok,
+        .name_text = name_text,
+        .occurrences = .empty,
+    }) catch @panic("OOM");
+    return &self.pending_meta_names.items[self.pending_meta_names.items.len - 1];
+}
+
+fn parseMetaDirectives(self: *Parser) void {
+    while (self.peek() == Tag.hash or self.peek() == Tag.hashBang) {
+        self.parseOneMetaItem();
+        self.consumeLine();
+    }
+}
+
+fn isNameLike(tag: Tag) bool {
+    return tag == Tag.name or @intFromEnum(tag) >= @intFromEnum(Tag.asKeyword) and @intFromEnum(tag) <= @intFromEnum(Tag.whileKeyword);
+}
+
+fn consumeNameLike(self: *Parser, message: []const u8) ?Token {
+    if (isNameLike(self.peek())) {
+        _ = self.consumeToken();
+        return self.previous;
+    }
+    self.err(message);
+    return null;
+}
+
+fn parseOneMetaItem(self: *Parser) void {
+    const introducer_tag = self.peek();
+    if (introducer_tag != Tag.hash and introducer_tag != Tag.hashBang) return;
+    _ = self.consumeToken();
+    const introducer = self.previous orelse return;
+
+    const name_tok = self.consumeNameLike("Expect attribute name after '#'.") orelse return;
+    const attr = self.findOrAddPendingAttr(name_tok);
+
+    if (self.match(Tag.equal) != null) {
+        const value_node = self.consumeLiteral("Expect a Bool, Num, String or Identifier for a meta value.");
+        attr.occurrences.append(self.alloc(), ast.MetaOccurrence.init(introducer, .{ .expr = value_node })) catch {};
+    } else if (self.match(Tag.leftParen) != null) {
+        self.ignoreLine();
+        if (self.match(Tag.rightParen) != null) {
+            self.err("Expected meta attributes in group, group cannot be empty.");
+            const group = ast.MetaGroup.init(&.{});
+            attr.occurrences.append(self.alloc(), ast.MetaOccurrence.init(introducer, .{ .group = group })) catch {};
+        } else {
+            const InnerBuilder = struct {
+                key: []const u8,
+                key_tok: Token,
+                entries: std.ArrayListUnmanaged(ast.MetaGroupEntry),
+            };
+            var inner_builders: std.ArrayListUnmanaged(InnerBuilder) = .empty;
+
+            while (self.peek() != Tag.rightParen and self.peek() != Tag.eof) {
+                var inner_key: ?Token = null;
+                if (self.peek() == Tag.string) {
+                    inner_key = self.consume(Tag.string, "Expect name or string for meta attribute key.");
+                } else {
+                    inner_key = self.consumeNameLike("Expect name or string for meta attribute key.");
+                }
+                var inner_value: ?Node = null;
+                if (self.match(Tag.equal) != null) {
+                    inner_value = self.consumeLiteral("Expect a Bool, Num, String or Identifier for a meta value.");
+                }
+                if (inner_key) |k| {
+                    const key_text = k.name();
+                    const ib = blk: {
+                        for (inner_builders.items) |*b| {
+                            if (std.mem.eql(u8, b.key, key_text)) break :blk b;
+                        }
+                        inner_builders.append(self.alloc(), .{
+                            .key = key_text,
+                            .key_tok = k,
+                            .entries = .empty,
+                        }) catch {};
+                        break :blk &inner_builders.items[inner_builders.items.len - 1];
+                    };
+                    ib.entries.append(self.alloc(), ast.MetaGroupEntry.init(k, inner_value)) catch {};
+                }
+                self.ignoreLine();
+                if (self.match(Tag.comma) == null) break;
+                self.ignoreLine();
+            }
+            self.ignoreLine();
+            _ = self.consume(Tag.rightParen, "Expected ')' after grouped meta attributes.");
+
+            var group_items: std.ArrayListUnmanaged(ast.MetaGroupItem) = .empty;
+            for (inner_builders.items) |*ib| {
+                group_items.append(self.alloc(), ast.MetaGroupItem.init(
+                    ib.key,
+                    ib.key_tok,
+                    ib.entries.toOwnedSlice(self.alloc()) catch &.{},
+                )) catch {};
+            }
+            const group = ast.MetaGroup.init(group_items.toOwnedSlice(self.alloc()) catch &.{});
+            attr.occurrences.append(self.alloc(), ast.MetaOccurrence.init(introducer, .{ .group = group })) catch {};
+        }
+    } else {
+        if (self.peek() != Tag.line and self.peek() != Tag.eof) {
+            self.err("Expect an equal, newline or grouping after a meta attribute key.");
+        }
+        attr.occurrences.append(self.alloc(), ast.MetaOccurrence.init(introducer, .none)) catch {};
+    }
+}
+
+fn consumeLiteral(self: *Parser, message: []const u8) Node {
+    if (self.match(Tag.falseKeyword) != null) return .{ .BoolExpr = ast.BoolExpr.init(false) };
+    if (self.match(Tag.trueKeyword) != null) return .{ .BoolExpr = ast.BoolExpr.init(true) };
+    if (self.match(Tag.number) != null) return .{ .NumExpr = ast.NumExpr.init(self.previous.?) };
+    if (self.match(Tag.string) != null) return .{ .StringExpr = ast.StringExpr.init(self.previous.?) };
+    if (self.match(Tag.name) != null) return .{ .StringExpr = ast.StringExpr.init(self.previous.?) };
+    self.err(message);
+    _ = self.consumeToken();
+    return .{ .NullExpr = ast.NullExpr.init(self.previous.?) };
+}
+
 pub fn parseModule(self: *Parser) !Module {
+    self.parseMetaDirectives();
+    const module_meta = self.takeMeta();
     self.ignoreLine();
 
     var statements: std.ArrayListUnmanaged(Node) = .empty;
@@ -68,27 +217,11 @@ pub fn parseModule(self: *Parser) !Module {
         if (self.peek() == Tag.eof) break;
         self.consumeLine();
     }
-    return Module.init(try statements.toOwnedSlice(self.alloc()));
+    return Module.init(try statements.toOwnedSlice(self.alloc()), module_meta);
 }
 
 pub fn definition(self: *Parser) ast.Node {
-    while (self.match(Tag.hash) != null or self.match(Tag.hashBang) != null) {
-        _ = self.consume(Tag.name, "Expect attribute name.");
-        if (self.match(Tag.equal) != null) {
-            _ = self.expression();
-        }
-        if (self.match(Tag.leftParen) != null) {
-            while (self.peek() != Tag.rightParen and self.peek() != Tag.eof) {
-                _ = self.consume(Tag.name, "Expect attribute key.");
-                if (self.match(Tag.equal) != null) {
-                    _ = self.expression();
-                }
-                if (self.match(Tag.comma) == null) break;
-            }
-            _ = self.consume(Tag.rightParen, "Expect ')' after attribute.");
-        }
-        self.ignoreLine();
-    }
+    self.parseMetaDirectives();
 
     if (self.match(Tag.classKeyword) != null) return self.finishClass(null);
 
@@ -97,6 +230,11 @@ pub fn definition(self: *Parser) ast.Node {
         _ = self.consume(Tag.classKeyword, "Expect 'class' after 'foriegn'");
         return self.finishClass(foreignKeyword);
     }
+
+    if (self.pending_meta_names.items.len > 0) {
+        self.err("meta attributes can only be specified on a class or method");
+    }
+    _ = self.takeMeta();
 
     if (self.match(Tag.importKeyword) != null) {
         self.ignoreLine();
@@ -131,7 +269,7 @@ pub fn definition(self: *Parser) ast.Node {
             initializer.* = self.expression();
         }
 
-        return .{ .VarStmt = ast.VarStmt.init(name, initializer) };
+        return .{ .VarStmt = ast.VarStmt.init(name, initializer, null) };
     }
 
     return self.statement();
@@ -447,6 +585,7 @@ fn methodCall(self: *Parser, receiver: ?*ast.Node, name: Token) ast.Node {
 fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
     _ = .{ self, foreignKeyword };
     const name = self.consume(Tag.name, "Expect class name");
+    const class_meta = self.takeMeta();
 
     var superClass: ?Token = null;
     if (self.match(Tag.isKeyword) != null) {
@@ -457,6 +596,26 @@ fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
 
     _ = self.consume(Tag.leftBrace, "Expect '{' after class name.");
     self.ignoreLine();
+
+    var vars: std.ArrayListUnmanaged(ast.Node) = .empty;
+    self.parseMetaDirectives();
+    while (self.match(Tag.varKeyword) != null) {
+        var var_name: ?Token = null;
+        if (self.match(Tag.field) != null) {
+            var_name = self.previous;
+        } else {
+            var_name = self.consume(Tag.name, "Expect field name after var in a class.");
+        }
+        const var_meta = self.takeMeta();
+        self.ignoreLine();
+        _ = self.consume(Tag.equal, "Expect default value to be assigned to a field in a class.");
+        self.ignoreLine();
+        const initializer = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
+        initializer.* = self.expression();
+        _ = self.matchLine();
+        self.parseMetaDirectives();
+        vars.append(self.alloc(), .{ .VarStmt = ast.VarStmt.init(var_name, initializer, var_meta) }) catch @panic("Error allocating memory");
+    }
 
     while (self.match(Tag.rightBrace) == null and self.peek() != Tag.eof) {
         if (self.peek() == Tag.field or self.peek() == Tag.staticField) {
@@ -469,27 +628,11 @@ fn finishClass(self: *Parser, foreignKeyword: ?Token) ast.Node {
 
         self.consumeLine();
     }
-    return .{ .ClassStmt = ast.ClassStmt.init(foreignKeyword, name, superClass, methods.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory")) };
+    return .{ .ClassStmt = ast.ClassStmt.init(foreignKeyword, name, superClass, methods.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory"), vars.toOwnedSlice(self.alloc()) catch @panic("Error allocating memory"), class_meta) };
 }
 
 fn method(self: *Parser) ast.Node {
-    while (self.match(Tag.hash) != null or self.match(Tag.hashBang) != null) {
-        _ = self.consume(Tag.name, "Expect attribute name.");
-        if (self.match(Tag.equal) != null) {
-            _ = self.expression();
-        }
-        if (self.match(Tag.leftParen) != null) {
-            while (self.peek() != Tag.rightParen and self.peek() != Tag.eof) {
-                _ = self.consume(Tag.name, "Expect attribute key.");
-                if (self.match(Tag.equal) != null) {
-                    _ = self.expression();
-                }
-                if (self.match(Tag.comma) == null) break;
-            }
-            _ = self.consume(Tag.rightParen, "Expect ')' after attribute.");
-        }
-        self.ignoreLine();
-    }
+    self.parseMetaDirectives();
 
     var foreignKeyword: ?Token = null;
 
@@ -570,6 +713,8 @@ fn method(self: *Parser) ast.Node {
         }
     }
 
+    const method_meta = self.takeMeta();
+
     const body = self.alloc().create(?ast.Node) catch @panic("Error allocating memory");
     body.* = null;
     if (foreignKeyword == null) {
@@ -577,7 +722,7 @@ fn method(self: *Parser) ast.Node {
         body.* = self.finishBody(parameters);
     }
 
-    return .{ .Method = ast.Method.init(foreignKeyword, staticKeyword, constructKeyword, name, parameters, body) };
+    return .{ .Method = ast.Method.init(foreignKeyword, staticKeyword, constructKeyword, name, parameters, body, method_meta) };
 }
 
 fn finishCall(self: *Parser) struct {
@@ -1094,4 +1239,175 @@ test "#4 - assignment to undefined variable should error" {
         if (std.mem.indexOf(u8, diag.message, "Foo") != null) break true;
     } else false;
     try std.testing.expect(has_foo_error);
+}
+
+test "meta - flag attribute on class" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\#deprecated
+        \\class Foo {}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expect(class_stmt.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.meta.?.attrs.len);
+    try std.testing.expectEqualStrings("deprecated", class_stmt.meta.?.attrs[0].name_tok.name());
+    try std.testing.expectEqual(ast.MetaOccurrenceValue.none, class_stmt.meta.?.attrs[0].occurrences[0].value);
+}
+
+test "meta - key=value attribute on class" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\#doc = "hello"
+        \\class Bar {}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expect(class_stmt.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.meta.?.attrs.len);
+    try std.testing.expectEqualStrings("doc", class_stmt.meta.?.attrs[0].name_tok.name());
+    switch (class_stmt.meta.?.attrs[0].occurrences[0].value) {
+        .expr => |e| {
+            switch (e) {
+                .StringExpr => |s| try std.testing.expectEqualStrings("\"hello\"", s.value.name()),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "meta - grouped attributes on class" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\#route(method = "GET", path = "/")
+        \\class Handler {}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expect(class_stmt.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.meta.?.attrs.len);
+    try std.testing.expectEqualStrings("route", class_stmt.meta.?.attrs[0].name_tok.name());
+    switch (class_stmt.meta.?.attrs[0].occurrences[0].value) {
+        .group => |g| try std.testing.expectEqual(@as(usize, 2), g.items.len),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "meta - attribute on method inside class" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\class A {
+        \\  #deprecated
+        \\  static hi() {}
+        \\}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.methods.len);
+    const method_node = switch (class_stmt.methods[0]) {
+        .Method => |m| m,
+        else => unreachable,
+    };
+    try std.testing.expect(method_node.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), method_node.meta.?.attrs.len);
+    try std.testing.expectEqualStrings("deprecated", method_node.meta.?.attrs[0].name_tok.name());
+}
+
+test "meta - module level meta" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\#module
+        \\var x = 1
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    try std.testing.expect(module.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), module.meta.?.attrs.len);
+    try std.testing.expectEqualStrings("module", module.meta.?.attrs[0].name_tok.name());
+}
+
+test "meta - hashBang runtime access attribute" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\#!runtime
+        \\class Foo {}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+    try std.testing.expect(class_stmt.meta != null);
+    try std.testing.expectEqual(@as(usize, 1), class_stmt.meta.?.attrs.len);
+    try std.testing.expectEqual(Token.Tag.hashBang, class_stmt.meta.?.attrs[0].occurrences[0].introducer.type);
+    try std.testing.expectEqualStrings("runtime", class_stmt.meta.?.attrs[0].name_tok.name());
 }

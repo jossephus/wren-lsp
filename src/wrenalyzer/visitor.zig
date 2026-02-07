@@ -192,6 +192,9 @@ fn visitClassStmt(v: anytype, stmt: ast.ClassStmt) void {
     for (stmt.methods) |*method| {
         walk(v, method);
     }
+    for (stmt.vars) |*var_node| {
+        walk(v, var_node);
+    }
 }
 
 fn visitMethod(v: anytype, method: ast.Method) void {
