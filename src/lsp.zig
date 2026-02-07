@@ -388,6 +388,10 @@ pub const Handler = struct {
 
         const offset = doc.positionToOffset(position.line, position.character - 1) orelse return null;
 
+        if (try self.getAttributeCompletions(arena, doc, offset, uri)) |items| {
+            return items;
+        }
+
         var end = offset;
         while (end > 0 and isIdentChar(doc.src[end - 1])) {
             end -= 1;
@@ -1104,6 +1108,253 @@ pub const Handler = struct {
         return null;
     }
 
+    const AttributeChain = struct {
+        class_name: []const u8,
+        depth: enum { attributes, self_level, methods_level },
+    };
+
+    fn parseAttributeChain(src: []const u8, dot_offset: usize) ?AttributeChain {
+        var pos = dot_offset;
+
+        var seg2_end = pos;
+        while (seg2_end > 0 and isIdentChar(src[seg2_end - 1])) {
+            seg2_end -= 1;
+        }
+        const seg2 = src[seg2_end..pos];
+
+        if (seg2.len == 0) return null;
+
+        if (seg2_end == 0 or src[seg2_end - 1] != '.') return null;
+        pos = seg2_end - 1;
+
+        if (std.mem.eql(u8, seg2, "self") or std.mem.eql(u8, seg2, "methods")) {
+            var seg1_end = pos;
+            while (seg1_end > 0 and isIdentChar(src[seg1_end - 1])) {
+                seg1_end -= 1;
+            }
+            const seg1 = src[seg1_end..pos];
+            if (!std.mem.eql(u8, seg1, "attributes")) return null;
+
+            if (seg1_end == 0 or src[seg1_end - 1] != '.') return null;
+            pos = seg1_end - 1;
+
+            var class_end = pos;
+            while (class_end > 0 and isIdentChar(src[class_end - 1])) {
+                class_end -= 1;
+            }
+            const class_name = src[class_end..pos];
+            if (class_name.len == 0) return null;
+
+            return .{
+                .class_name = class_name,
+                .depth = if (std.mem.eql(u8, seg2, "self")) .self_level else .methods_level,
+            };
+        }
+
+        if (std.mem.eql(u8, seg2, "attributes")) {
+            var class_end = pos;
+            while (class_end > 0 and isIdentChar(src[class_end - 1])) {
+                class_end -= 1;
+            }
+            const class_name = src[class_end..pos];
+            if (class_name.len == 0) return null;
+
+            return .{ .class_name = class_name, .depth = .attributes };
+        }
+
+        return null;
+    }
+
+    fn getAttributeCompletions(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        dot_offset: usize,
+        uri: []const u8,
+    ) !?[]types.CompletionItem {
+        const chain = parseAttributeChain(doc.src, dot_offset) orelse return null;
+
+        log.debug("attribute completion: class='{s}' depth={s}", .{
+            chain.class_name,
+            @tagName(chain.depth),
+        });
+
+        const class_stmt = try self.findClassStmt(arena, doc, chain.class_name, uri) orelse return null;
+
+        return switch (chain.depth) {
+            .attributes => blk: {
+                var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
+                if (hasRuntimeMeta(class_stmt.meta)) {
+                    try items.append(arena, .{ .label = "self", .kind = .Property, .detail = "Class-level attributes" });
+                }
+                if (hasAnyMethodRuntimeMeta(class_stmt.methods)) {
+                    try items.append(arena, .{ .label = "methods", .kind = .Property, .detail = "Method-level attributes" });
+                }
+                break :blk if (items.items.len > 0) items.items else null;
+            },
+            .self_level => self.getClassAttributeGroupCompletions(arena, class_stmt),
+            .methods_level => self.getMethodAttributeSignatureCompletions(arena, class_stmt.methods),
+        };
+    }
+
+    fn findClassStmt(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        class_name: []const u8,
+        uri: []const u8,
+    ) !?wrenalyzer.Ast.ClassStmt {
+        for (doc.module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |cs| {
+                    if (cs.name) |n| {
+                        if (std.mem.eql(u8, n.name(), class_name)) return cs;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (self.findImportPath(doc, class_name)) |import_path| {
+            const import_uri = try self.resolveImportUri(arena, uri, import_path);
+            if (try self.resolveClassDefinition(arena, import_uri, class_name, 0)) |result| {
+                for (result.module.statements) |stmt| {
+                    switch (stmt) {
+                        .ClassStmt => |cs| {
+                            if (cs.name) |n| {
+                                if (std.mem.eql(u8, n.name(), class_name)) return cs;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    fn hasRuntimeMeta(meta: ?*const wrenalyzer.Ast.Meta) bool {
+        const m = meta orelse return false;
+        for (m.attrs) |attr| {
+            for (attr.occurrences) |occ| {
+                if (occ.introducer.type == .hashBang) return true;
+            }
+        }
+        return false;
+    }
+
+    fn hasAnyMethodRuntimeMeta(methods: []wrenalyzer.Ast.Node) bool {
+        for (methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (hasRuntimeMeta(method.meta)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn getClassAttributeGroupCompletions(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        class_stmt: wrenalyzer.Ast.ClassStmt,
+    ) !?[]types.CompletionItem {
+        const meta = class_stmt.meta orelse return null;
+        var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
+        var seen_ungrouped = false;
+
+        for (meta.attrs) |attr| {
+            var is_runtime = false;
+            var has_group = false;
+            var has_ungrouped = false;
+
+            for (attr.occurrences) |occ| {
+                if (occ.introducer.type != .hashBang) continue;
+                is_runtime = true;
+                switch (occ.value) {
+                    .group => has_group = true,
+                    .none, .expr => has_ungrouped = true,
+                }
+            }
+
+            if (!is_runtime) continue;
+
+            if (has_group) {
+                try items.append(arena, .{
+                    .label = attr.name_tok.name(),
+                    .kind = .Property,
+                    .detail = "Attribute group",
+                });
+            }
+            if (has_ungrouped and !seen_ungrouped) {
+                seen_ungrouped = true;
+            }
+        }
+
+        if (items.items.len == 0 and !seen_ungrouped) return null;
+        return items.items;
+    }
+
+    fn getMethodAttributeSignatureCompletions(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        methods: []wrenalyzer.Ast.Node,
+    ) !?[]types.CompletionItem {
+        var items: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
+
+        for (methods) |method_node| {
+            switch (method_node) {
+                .Method => |method| {
+                    if (!hasRuntimeMeta(method.meta)) continue;
+                    const name_tok = method.name orelse continue;
+                    const sig = try formatMethodSignature(arena, method, name_tok.name());
+                    try items.append(arena, .{
+                        .label = sig,
+                        .kind = .Method,
+                        .detail = "Method with runtime attributes",
+                    });
+                },
+                else => {},
+            }
+        }
+
+        if (items.items.len == 0) return null;
+        return items.items;
+    }
+
+    fn formatMethodSignature(
+        arena: std.mem.Allocator,
+        method: wrenalyzer.Ast.Method,
+        name: []const u8,
+    ) ![]const u8 {
+        const prefix: []const u8 = if (method.foreignKeyword != null and method.staticKeyword != null)
+            "foreign static "
+        else if (method.staticKeyword != null)
+            "static "
+        else if (method.constructKeyword != null)
+            ""
+        else
+            "";
+
+        const arity = method.parameters.len;
+        if (arity == 0) {
+            return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, name });
+        }
+
+        var params_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try params_buf.appendSlice(arena, prefix);
+        try params_buf.appendSlice(arena, name);
+        try params_buf.append(arena, '(');
+        for (0..arity) |i| {
+            if (i > 0) try params_buf.append(arena, ',');
+            try params_buf.append(arena, '_');
+        }
+        try params_buf.append(arena, ')');
+        return params_buf.items;
+    }
+
     fn classExistsInModule(self: *Handler, module: wrenalyzer.Ast.Module, class_name: []const u8) bool {
         _ = self;
         for (module.statements) |stmt| {
@@ -1732,6 +1983,11 @@ pub const Handler = struct {
             return null;
         };
 
+        // Check if cursor is on a meta attribute
+        if (try self.getMetaHover(arena, doc, params.position)) |hover| {
+            return hover;
+        }
+
         // First check if cursor is on a resolved reference (use site or declaration)
         if (doc.resolvedAtPosition(params.position.line, params.position.character)) |resolved| {
             const kind_str = switch (resolved.kind) {
@@ -1846,6 +2102,204 @@ pub const Handler = struct {
         }
 
         return std.fmt.allocPrint(arena, "**{s}** `{s}`", .{ kind_str, name });
+    }
+
+    const MetaContext = struct {
+        owner_name: []const u8,
+        owner_kind: []const u8,
+    };
+
+    fn getMetaHover(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        position: types.Position,
+    ) !?types.Hover {
+        const offset = doc.positionToOffset(position.line, position.character) orelse return null;
+
+        const module = doc.module;
+
+        if (module.meta) |meta| {
+            if (try findMetaAtOffset(arena, meta, offset, .{ .owner_name = "(module)", .owner_kind = "module" })) |hover| {
+                return hover;
+            }
+        }
+
+        for (module.statements) |stmt| {
+            if (try findMetaInStatement(arena, stmt, offset)) |hover| {
+                return hover;
+            }
+        }
+
+        return null;
+    }
+
+    fn findMetaInStatement(
+        arena: std.mem.Allocator,
+        stmt: wrenalyzer.Ast.Node,
+        offset: usize,
+    ) !?types.Hover {
+        switch (stmt) {
+            .ClassStmt => |class_stmt| {
+                const class_name = if (class_stmt.name) |t| t.name() else "(anonymous)";
+                if (class_stmt.meta) |meta| {
+                    if (try findMetaAtOffset(arena, meta, offset, .{
+                        .owner_name = class_name,
+                        .owner_kind = "class",
+                    })) |hover| return hover;
+                }
+                for (class_stmt.methods) |method_node| {
+                    switch (method_node) {
+                        .Method => |method| {
+                            const method_name = if (method.name) |t| t.name() else "(anonymous)";
+                            if (method.meta) |meta| {
+                                if (try findMetaAtOffset(arena, meta, offset, .{
+                                    .owner_name = method_name,
+                                    .owner_kind = if (method.staticKeyword != null) "static method" else if (method.constructKeyword != null) "constructor" else "method",
+                                })) |hover| return hover;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            .VarStmt => |var_stmt| {
+                const var_name = if (var_stmt.name) |t| t.name() else "(anonymous)";
+                if (var_stmt.meta) |meta| {
+                    if (try findMetaAtOffset(arena, meta, offset, .{
+                        .owner_name = var_name,
+                        .owner_kind = "variable",
+                    })) |hover| return hover;
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn findMetaAtOffset(
+        arena: std.mem.Allocator,
+        meta: *const wrenalyzer.Ast.Meta,
+        offset: usize,
+        ctx: MetaContext,
+    ) !?types.Hover {
+        for (meta.attrs) |attr| {
+            const name_tok = attr.name_tok;
+            for (attr.occurrences) |occ| {
+                const intro_start = occ.introducer.start;
+                const attr_end = computeOccurrenceEnd(occ, name_tok);
+
+                if (offset >= intro_start and offset < attr_end) {
+                    const content = try formatMetaAttrHover(arena, attr, ctx);
+                    return .{
+                        .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = content } },
+                        .range = tokenToRange(name_tok),
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
+    fn computeOccurrenceEnd(occ: wrenalyzer.Ast.MetaOccurrence, name_tok: Token) usize {
+        switch (occ.value) {
+            .none => return name_tok.start + name_tok.length,
+            .expr => |expr| {
+                const val_tok = switch (expr) {
+                    .BoolExpr => |_| name_tok,
+                    .NumExpr => |n| n.value,
+                    .StringExpr => |s| s.value,
+                    else => name_tok,
+                };
+                return val_tok.start + val_tok.length;
+            },
+            .group => |group| {
+                var end = name_tok.start + name_tok.length;
+                for (group.items) |item| {
+                    for (item.entries) |entry| {
+                        const key_end = entry.key_tok.start + entry.key_tok.length;
+                        if (key_end > end) end = key_end;
+                        if (entry.value) |val| {
+                            const val_end = switch (val) {
+                                .NumExpr => |n| n.value.start + n.value.length,
+                                .StringExpr => |s| s.value.start + s.value.length,
+                                .BoolExpr => |_| key_end,
+                                else => key_end,
+                            };
+                            if (val_end > end) end = val_end;
+                        }
+                    }
+                }
+                return end + 1;
+            },
+        }
+    }
+
+    fn formatMetaAttrHover(
+        arena: std.mem.Allocator,
+        attr: wrenalyzer.Ast.MetaAttr,
+        ctx: MetaContext,
+    ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        const writer = buf.writer(arena);
+
+        var is_runtime = false;
+        for (attr.occurrences) |occ| {
+            if (occ.introducer.type == .hashBang) {
+                is_runtime = true;
+                break;
+            }
+        }
+
+        if (is_runtime) {
+            try writer.writeAll("**#! attribute** (runtime)\n\n");
+        } else {
+            try writer.writeAll("**# attribute** (compile-time)\n\n");
+        }
+
+        try writer.print("**Name:** `{s}`\n\n", .{attr.name_tok.name()});
+        try writer.print("**On:** {s} `{s}`\n\n", .{ ctx.owner_kind, ctx.owner_name });
+
+        for (attr.occurrences) |occ| {
+            const prefix: []const u8 = if (occ.introducer.type == .hashBang) "#!" else "#";
+            switch (occ.value) {
+                .none => {
+                    try writer.print("```wren\n{s}{s}\n```\n", .{ prefix, attr.name_tok.name() });
+                },
+                .expr => |expr| {
+                    const val_str = switch (expr) {
+                        .StringExpr => |s| s.value.name(),
+                        .NumExpr => |n| n.value.name(),
+                        .BoolExpr => |b| if (b.value) "true" else "false",
+                        else => "?",
+                    };
+                    try writer.print("```wren\n{s}{s} = {s}\n```\n", .{ prefix, attr.name_tok.name(), val_str });
+                },
+                .group => |group| {
+                    try writer.print("```wren\n{s}{s}(", .{ prefix, attr.name_tok.name() });
+                    var first = true;
+                    for (group.items) |item| {
+                        for (item.entries) |entry| {
+                            if (!first) try writer.writeAll(", ");
+                            first = false;
+                            try writer.writeAll(entry.key_tok.name());
+                            if (entry.value) |val| {
+                                const val_str = switch (val) {
+                                    .StringExpr => |s| s.value.name(),
+                                    .NumExpr => |n| n.value.name(),
+                                    .BoolExpr => |b| if (b.value) "true" else "false",
+                                    else => "?",
+                                };
+                                try writer.print(" = {s}", .{val_str});
+                            }
+                        }
+                    }
+                    try writer.writeAll(")\n```\n");
+                },
+            }
+        }
+
+        return buf.items;
     }
 
     pub fn @"textDocument/definition"(
@@ -2173,6 +2627,34 @@ pub const Handler = struct {
         };
 
         log.info("definition: checking for property access at offset {d}", .{offset});
+
+        // Check for runtime meta attribute access: ClassName.attributes.self["key"]
+        if (self.findMetaAttrAccessAtOffset(doc, offset)) |target| {
+            log.info("definition: found meta attr access: class='{s}' method={s} key='{s}'", .{
+                target.class_name,
+                target.method_name orelse "(self)",
+                target.key,
+            });
+            if (try self.resolveMetaAttrDefinition(arena, doc, params.textDocument.uri, target)) |result| {
+                return result;
+            }
+        }
+
+        // Check if cursor is on a #!key declaration
+        if (findMetaAttrDeclAtOffset(doc.module, offset)) |target| {
+            log.info("definition: cursor on meta attr declaration: class='{s}' key='{s}'", .{
+                target.class_name,
+                target.key,
+            });
+            return .{
+                .Definition = .{
+                    .Location = .{
+                        .uri = params.textDocument.uri,
+                        .range = tokenToRange(target.name_tok),
+                    },
+                },
+            };
+        }
 
         // Look for pattern like "user.name" where cursor is on "name"
         if (self.findPropertyAccessAtOffset(arena, doc, offset)) |prop_access| {
@@ -2996,6 +3478,16 @@ pub const Handler = struct {
     ) !lsp.ResultType("textDocument/references") {
         const doc = self.files.get(params.textDocument.uri) orelse return null;
 
+        // Check if cursor is on a runtime meta attribute declaration or usage
+        const offset = doc.positionToOffset(params.position.line, params.position.character);
+        if (offset) |off| {
+            const meta_target = findMetaAttrDeclAtOffset(doc.module, off) orelse
+                self.findMetaAttrAccessAtOffset(doc, off);
+            if (meta_target) |target| {
+                return self.findMetaAttrReferences(arena, doc, params.textDocument.uri, target, params.context.includeDeclaration);
+            }
+        }
+
         const include_decl = params.context.includeDeclaration;
 
         var decl_token_start: ?usize = null;
@@ -3082,6 +3574,589 @@ pub const Handler = struct {
 
         if (locations.items.len == 0) return null;
         return locations.items;
+    }
+
+    // --- Runtime meta attribute go-to-definition / find-references ---
+
+    const MetaAttrTarget = struct {
+        class_name: []const u8,
+        method_name: ?[]const u8,
+        key: []const u8,
+        name_tok: Token,
+    };
+
+    fn findMetaAttrAccessAtOffset(self: *Handler, doc: Document, offset: usize) ?MetaAttrTarget {
+        _ = self;
+        return findMetaAttrAccessInNodes(doc.module.statements, offset);
+    }
+
+    fn findMetaAttrAccessInNodes(stmts: []const wrenalyzer.Ast.Node, offset: usize) ?MetaAttrTarget {
+        for (stmts) |node| {
+            if (findMetaAttrAccessInNode(node, offset)) |target| {
+                return target;
+            }
+        }
+        return null;
+    }
+
+    fn findMetaAttrAccessInNode(node: wrenalyzer.Ast.Node, offset: usize) ?MetaAttrTarget {
+        switch (node) {
+            .SubscriptExpr => |sub| {
+                if (matchMetaAttrSubscript(sub, offset)) |target| {
+                    return target;
+                }
+                if (findMetaAttrAccessInNode(sub.receiver.*, offset)) |t| return t;
+                for (sub.arguments) |arg| {
+                    if (findMetaAttrAccessInNode(arg, offset)) |t| return t;
+                }
+            },
+            .CallExpr => |call| {
+                if (call.receiver) |recv_ptr| {
+                    if (findMetaAttrAccessInNode(recv_ptr.*, offset)) |t| return t;
+                }
+                for (call.arguments) |arg| {
+                    if (findMetaAttrAccessInNode(arg, offset)) |t| return t;
+                }
+                if (call.blockArgument.*) |block| {
+                    if (findMetaAttrAccessInNode(block, offset)) |t| return t;
+                }
+            },
+            .VarStmt => |var_stmt| {
+                if (var_stmt.initializer.*) |initializer| {
+                    if (findMetaAttrAccessInNode(initializer, offset)) |t| return t;
+                }
+            },
+            .ClassStmt => |class_stmt| {
+                for (class_stmt.methods) |method_node| {
+                    if (findMetaAttrAccessInNode(method_node, offset)) |t| return t;
+                }
+            },
+            .Method => |method| {
+                if (method.body.*) |body| {
+                    if (findMetaAttrAccessInNode(body, offset)) |t| return t;
+                }
+            },
+            .Body => |body| {
+                if (body.expression) |expr_ptr| {
+                    if (findMetaAttrAccessInNode(expr_ptr.*, offset)) |t| return t;
+                }
+                if (body.statements) |stmts| {
+                    for (stmts) |stmt| {
+                        if (findMetaAttrAccessInNode(stmt, offset)) |t| return t;
+                    }
+                }
+            },
+            .BlockStmt => |block| {
+                for (block.statements) |stmt| {
+                    if (findMetaAttrAccessInNode(stmt, offset)) |t| return t;
+                }
+            },
+            .IfStmt => |if_stmt| {
+                if (findMetaAttrAccessInNode(if_stmt.condition.*, offset)) |t| return t;
+                if (findMetaAttrAccessInNode(if_stmt.thenBranch.*, offset)) |t| return t;
+                if (if_stmt.elseBranch) |else_ptr| {
+                    if (findMetaAttrAccessInNode(else_ptr.*, offset)) |t| return t;
+                }
+            },
+            .WhileStmt => |while_stmt| {
+                if (findMetaAttrAccessInNode(while_stmt.condition.*, offset)) |t| return t;
+                if (findMetaAttrAccessInNode(while_stmt.body.*, offset)) |t| return t;
+            },
+            .ForStmt => |for_stmt| {
+                if (findMetaAttrAccessInNode(for_stmt.iterator.*, offset)) |t| return t;
+                if (findMetaAttrAccessInNode(for_stmt.body.*, offset)) |t| return t;
+            },
+            .ReturnStmt => |ret| {
+                if (ret.value.*) |val| {
+                    if (findMetaAttrAccessInNode(val, offset)) |t| return t;
+                }
+            },
+            .InfixExpr => |infix| {
+                if (findMetaAttrAccessInNode(infix.left.*, offset)) |t| return t;
+                if (findMetaAttrAccessInNode(infix.right.*, offset)) |t| return t;
+            },
+            .PrefixExpr => |prefix| {
+                if (findMetaAttrAccessInNode(prefix.right.*, offset)) |t| return t;
+            },
+            .AssignmentExpr => |assign| {
+                if (findMetaAttrAccessInNode(assign.target.*, offset)) |t| return t;
+                if (findMetaAttrAccessInNode(assign.value.*, offset)) |t| return t;
+            },
+            .GroupingExpr => |group| {
+                if (findMetaAttrAccessInNode(group.expression.*, offset)) |t| return t;
+            },
+            .ListExpr => |list| {
+                for (list.elements) |elem| {
+                    if (findMetaAttrAccessInNode(elem, offset)) |t| return t;
+                }
+            },
+            .MapExpr => |map| {
+                for (map.entries) |entry| {
+                    if (findMetaAttrAccessInNode(entry, offset)) |t| return t;
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    /// Match: SubscriptExpr where cursor is on the string key argument and
+    /// receiver chain is ClassName.attributes.self or ClassName.attributes.methods[X]
+    fn matchMetaAttrSubscript(sub: wrenalyzer.Ast.SubscriptExpr, offset: usize) ?MetaAttrTarget {
+        if (sub.arguments.len != 1) return null;
+        const arg = sub.arguments[0];
+        const str_tok = switch (arg) {
+            .StringExpr => |s| s.value,
+            else => return null,
+        };
+
+        if (offset < str_tok.start or offset >= str_tok.start + str_tok.length) return null;
+
+        const key = stripQuotes(str_tok.name());
+        if (key.len == 0) return null;
+
+        // Pattern 1: ClassName.attributes.self["key"]
+        // receiver = CallExpr(name="self", receiver=CallExpr(name="attributes", receiver=CallExpr(name=ClassName)))
+        if (matchAttrSelfChain(sub.receiver.*)) |class_name| {
+            return .{
+                .class_name = class_name,
+                .method_name = null,
+                .key = key,
+                .name_tok = str_tok,
+            };
+        }
+
+        // Pattern 2: ClassName.attributes.methods["methodName"]["key"]
+        // receiver = SubscriptExpr(
+        //   receiver = CallExpr(name="methods", receiver=CallExpr(name="attributes", receiver=CallExpr(name=ClassName))),
+        //   args = [StringExpr("methodName")]
+        // )
+        if (matchAttrMethodsChain(sub.receiver.*)) |result| {
+            return .{
+                .class_name = result.class_name,
+                .method_name = result.method_name,
+                .key = key,
+                .name_tok = str_tok,
+            };
+        }
+
+        return null;
+    }
+
+    fn matchAttrSelfChain(node: wrenalyzer.Ast.Node) ?[]const u8 {
+        // CallExpr(name="self", receiver=CallExpr(name="attributes", receiver=CallExpr(name=ClassName, receiver=null)))
+        const self_call = switch (node) {
+            .CallExpr => |c| c,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, self_call.name.name(), "self")) return null;
+        const attr_ptr = self_call.receiver orelse return null;
+        return matchAttrChainBase(attr_ptr.*);
+    }
+
+    const MethodChainResult = struct {
+        class_name: []const u8,
+        method_name: []const u8,
+    };
+
+    fn matchAttrMethodsChain(node: wrenalyzer.Ast.Node) ?MethodChainResult {
+        // SubscriptExpr(
+        //   receiver = CallExpr(name="methods", receiver=CallExpr(name="attributes", receiver=ClassName)),
+        //   args = [StringExpr("methodName")]
+        // )
+        const inner_sub = switch (node) {
+            .SubscriptExpr => |s| s,
+            else => return null,
+        };
+        if (inner_sub.arguments.len != 1) return null;
+        const method_str = switch (inner_sub.arguments[0]) {
+            .StringExpr => |s| s.value,
+            else => return null,
+        };
+        const method_name = stripQuotes(method_str.name());
+        if (method_name.len == 0) return null;
+
+        const methods_call = switch (inner_sub.receiver.*) {
+            .CallExpr => |c| c,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, methods_call.name.name(), "methods")) return null;
+        const attr_ptr = methods_call.receiver orelse return null;
+        const class_name = matchAttrChainBase(attr_ptr.*) orelse return null;
+        return .{ .class_name = class_name, .method_name = method_name };
+    }
+
+    fn matchAttrChainBase(node: wrenalyzer.Ast.Node) ?[]const u8 {
+        // CallExpr(name="attributes", receiver=CallExpr(name=ClassName, receiver=null))
+        const attr_call = switch (node) {
+            .CallExpr => |c| c,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, attr_call.name.name(), "attributes")) return null;
+        const class_ptr = attr_call.receiver orelse return null;
+        const class_call = switch (class_ptr.*) {
+            .CallExpr => |c| c,
+            else => return null,
+        };
+        if (class_call.receiver != null) return null;
+        return class_call.name.name();
+    }
+
+    /// Find a #! meta attribute declaration at the given offset.
+    fn findMetaAttrDeclAtOffset(module: wrenalyzer.Ast.Module, offset: usize) ?MetaAttrTarget {
+        for (module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    const class_name = if (class_stmt.name) |t| t.name() else continue;
+                    // Class-level meta
+                    if (class_stmt.meta) |meta| {
+                        if (findRuntimeAttrAtOffset(meta, offset)) |attr| {
+                            return .{
+                                .class_name = class_name,
+                                .method_name = null,
+                                .key = attr.name_tok.name(),
+                                .name_tok = attr.name_tok,
+                            };
+                        }
+                    }
+                    // Method-level meta
+                    for (class_stmt.methods) |method_node| {
+                        switch (method_node) {
+                            .Method => |method| {
+                                if (method.meta) |meta| {
+                                    if (findRuntimeAttrAtOffset(meta, offset)) |attr| {
+                                        return .{
+                                            .class_name = class_name,
+                                            .method_name = if (method.name) |t| t.name() else null,
+                                            .key = attr.name_tok.name(),
+                                            .name_tok = attr.name_tok,
+                                        };
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn findRuntimeAttrAtOffset(meta: *const wrenalyzer.Ast.Meta, offset: usize) ?wrenalyzer.Ast.MetaAttr {
+        for (meta.attrs) |attr| {
+            for (attr.occurrences) |occ| {
+                if (occ.introducer.type != .hashBang) continue;
+                const intro_start = occ.introducer.start;
+                const attr_end = attr.name_tok.start + attr.name_tok.length;
+                if (offset >= intro_start and offset < attr_end) {
+                    return attr;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn resolveMetaAttrDefinition(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        current_uri: []const u8,
+        target: MetaAttrTarget,
+    ) !?lsp.ResultType("textDocument/definition") {
+        // Find the class definition (possibly in another module)
+        var def_uri: []const u8 = current_uri;
+        var def_module: wrenalyzer.Ast.Module = doc.module;
+
+        if (self.getSymbolSourceModule(arena, current_uri, target.class_name)) |source_uri| {
+            if (try self.resolveClassDefinition(arena, source_uri, target.class_name, 0)) |result| {
+                def_uri = result.uri;
+                def_module = result.module;
+            }
+        }
+
+        // Search the ClassStmt in the target module
+        for (def_module.statements) |stmt| {
+            switch (stmt) {
+                .ClassStmt => |class_stmt| {
+                    const name = if (class_stmt.name) |t| t.name() else continue;
+                    if (!std.mem.eql(u8, name, target.class_name)) continue;
+
+                    if (target.method_name == null) {
+                        // Class-level attribute
+                        if (class_stmt.meta) |meta| {
+                            if (findRuntimeAttrByKey(meta, target.key)) |attr_tok| {
+                                return .{
+                                    .Definition = .{
+                                        .Location = .{
+                                            .uri = def_uri,
+                                            .range = tokenToRange(attr_tok),
+                                        },
+                                    },
+                                };
+                            }
+                        }
+                    } else {
+                        // Method-level attribute
+                        for (class_stmt.methods) |method_node| {
+                            switch (method_node) {
+                                .Method => |method| {
+                                    const mname = if (method.name) |t| t.name() else continue;
+                                    if (!std.mem.eql(u8, mname, target.method_name.?)) continue;
+                                    if (method.meta) |meta| {
+                                        if (findRuntimeAttrByKey(meta, target.key)) |attr_tok| {
+                                            return .{
+                                                .Definition = .{
+                                                    .Location = .{
+                                                        .uri = def_uri,
+                                                        .range = tokenToRange(attr_tok),
+                                                    },
+                                                },
+                                            };
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn findRuntimeAttrByKey(meta: *const wrenalyzer.Ast.Meta, key: []const u8) ?Token {
+        for (meta.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name_tok.name(), key)) continue;
+            for (attr.occurrences) |occ| {
+                if (occ.introducer.type == .hashBang) {
+                    return attr.name_tok;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn findMetaAttrReferences(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        doc: Document,
+        current_uri: []const u8,
+        target: MetaAttrTarget,
+        include_decl: bool,
+    ) !?[]types.Location {
+        var locations: std.ArrayListUnmanaged(types.Location) = .empty;
+
+        // Find declaration location
+        var decl_uri: []const u8 = current_uri;
+        var decl_module: wrenalyzer.Ast.Module = doc.module;
+
+        if (self.getSymbolSourceModule(arena, current_uri, target.class_name)) |source_uri| {
+            if (try self.resolveClassDefinition(arena, source_uri, target.class_name, 0)) |result| {
+                decl_uri = result.uri;
+                decl_module = result.module;
+            }
+        }
+
+        if (include_decl) {
+            // Add the declaration itself
+            for (decl_module.statements) |stmt| {
+                switch (stmt) {
+                    .ClassStmt => |class_stmt| {
+                        const name = if (class_stmt.name) |t| t.name() else continue;
+                        if (!std.mem.eql(u8, name, target.class_name)) continue;
+
+                        if (target.method_name == null) {
+                            if (class_stmt.meta) |meta| {
+                                if (findRuntimeAttrByKey(meta, target.key)) |attr_tok| {
+                                    try locations.append(arena, .{
+                                        .uri = decl_uri,
+                                        .range = tokenToRange(attr_tok),
+                                    });
+                                }
+                            }
+                        } else {
+                            for (class_stmt.methods) |method_node| {
+                                switch (method_node) {
+                                    .Method => |method| {
+                                        const mname = if (method.name) |t| t.name() else continue;
+                                        if (!std.mem.eql(u8, mname, target.method_name.?)) continue;
+                                        if (method.meta) |meta| {
+                                            if (findRuntimeAttrByKey(meta, target.key)) |attr_tok| {
+                                                try locations.append(arena, .{
+                                                    .uri = decl_uri,
+                                                    .range = tokenToRange(attr_tok),
+                                                });
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Search all loaded files for usages
+        var file_iter = self.files.iterator();
+        while (file_iter.next()) |entry| {
+            const file_uri = entry.key_ptr.*;
+            const file_doc = entry.value_ptr.*;
+            self.collectMetaAttrUsages(arena, &locations, file_uri, file_doc.module, target);
+        }
+
+        if (locations.items.len == 0) return null;
+        return locations.items;
+    }
+
+    fn collectMetaAttrUsages(
+        _: *Handler,
+        arena: std.mem.Allocator,
+        locations: *std.ArrayListUnmanaged(types.Location),
+        uri: []const u8,
+        module: wrenalyzer.Ast.Module,
+        target: MetaAttrTarget,
+    ) void {
+        for (module.statements) |stmt| {
+            collectMetaAttrUsagesInNode(arena, locations, uri, stmt, target);
+        }
+    }
+
+    fn collectMetaAttrUsagesInNode(
+        arena: std.mem.Allocator,
+        locations: *std.ArrayListUnmanaged(types.Location),
+        uri: []const u8,
+        node: wrenalyzer.Ast.Node,
+        target: MetaAttrTarget,
+    ) void {
+        switch (node) {
+            .SubscriptExpr => |sub| {
+                if (matchMetaAttrSubscriptForTarget(sub, target)) |str_tok| {
+                    locations.append(arena, .{
+                        .uri = uri,
+                        .range = tokenToRange(str_tok),
+                    }) catch {};
+                }
+                collectMetaAttrUsagesInNode(arena, locations, uri, sub.receiver.*, target);
+                for (sub.arguments) |arg| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, arg, target);
+                }
+            },
+            .CallExpr => |call| {
+                if (call.receiver) |recv_ptr| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, recv_ptr.*, target);
+                }
+                for (call.arguments) |arg| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, arg, target);
+                }
+                if (call.blockArgument.*) |block| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, block, target);
+                }
+            },
+            .VarStmt => |var_stmt| {
+                if (var_stmt.initializer.*) |initializer| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, initializer, target);
+                }
+            },
+            .ClassStmt => |class_stmt| {
+                for (class_stmt.methods) |method_node| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, method_node, target);
+                }
+            },
+            .Method => |method| {
+                if (method.body.*) |body| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, body, target);
+                }
+            },
+            .Body => |body| {
+                if (body.expression) |expr_ptr| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, expr_ptr.*, target);
+                }
+                if (body.statements) |stmts| {
+                    for (stmts) |stmt| {
+                        collectMetaAttrUsagesInNode(arena, locations, uri, stmt, target);
+                    }
+                }
+            },
+            .BlockStmt => |block| {
+                for (block.statements) |stmt| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, stmt, target);
+                }
+            },
+            .IfStmt => |if_stmt| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, if_stmt.condition.*, target);
+                collectMetaAttrUsagesInNode(arena, locations, uri, if_stmt.thenBranch.*, target);
+                if (if_stmt.elseBranch) |else_ptr| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, else_ptr.*, target);
+                }
+            },
+            .WhileStmt => |while_stmt| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, while_stmt.condition.*, target);
+                collectMetaAttrUsagesInNode(arena, locations, uri, while_stmt.body.*, target);
+            },
+            .ForStmt => |for_stmt| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, for_stmt.iterator.*, target);
+                collectMetaAttrUsagesInNode(arena, locations, uri, for_stmt.body.*, target);
+            },
+            .ReturnStmt => |ret| {
+                if (ret.value.*) |val| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, val, target);
+                }
+            },
+            .InfixExpr => |infix| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, infix.left.*, target);
+                collectMetaAttrUsagesInNode(arena, locations, uri, infix.right.*, target);
+            },
+            .PrefixExpr => |prefix| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, prefix.right.*, target);
+            },
+            .AssignmentExpr => |assign| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, assign.target.*, target);
+                collectMetaAttrUsagesInNode(arena, locations, uri, assign.value.*, target);
+            },
+            .GroupingExpr => |group| {
+                collectMetaAttrUsagesInNode(arena, locations, uri, group.expression.*, target);
+            },
+            .ListExpr => |list| {
+                for (list.elements) |elem| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, elem, target);
+                }
+            },
+            .MapExpr => |map| {
+                for (map.entries) |entry| {
+                    collectMetaAttrUsagesInNode(arena, locations, uri, entry, target);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn matchMetaAttrSubscriptForTarget(sub: wrenalyzer.Ast.SubscriptExpr, target: MetaAttrTarget) ?Token {
+        if (sub.arguments.len != 1) return null;
+        const arg = sub.arguments[0];
+        const str_tok = switch (arg) {
+            .StringExpr => |s| s.value,
+            else => return null,
+        };
+        const key = stripQuotes(str_tok.name());
+        if (!std.mem.eql(u8, key, target.key)) return null;
+
+        if (target.method_name == null) {
+            const class_name = matchAttrSelfChain(sub.receiver.*) orelse return null;
+            if (!std.mem.eql(u8, class_name, target.class_name)) return null;
+            return str_tok;
+        } else {
+            const result = matchAttrMethodsChain(sub.receiver.*) orelse return null;
+            if (!std.mem.eql(u8, result.class_name, target.class_name)) return null;
+            if (!std.mem.eql(u8, result.method_name, target.method_name.?)) return null;
+            return str_tok;
+        }
     }
 
     /// Check if a file imports a specific symbol from a specific module.
@@ -3834,13 +4909,75 @@ pub const Handler = struct {
         var prev_line: u32 = 0;
         var prev_col: u32 = 0;
 
+        const MetaState = enum { none, attr_name, attr_value, group_key, group_value };
+        var meta_state: MetaState = .none;
+
         var lexer = try wrenalyzer.Lexer.new(arena, doc.source_file);
 
         while (true) {
             const token = try lexer.readToken();
             if (token.type == .eof) break;
 
-            const token_type = tokenTagToSemanticType(token.type) orelse continue;
+            const token_type: types.SemanticTokenTypes = blk: {
+                switch (meta_state) {
+                    .none => {
+                        if (token.type == .hash or token.type == .hashBang) {
+                            meta_state = .attr_name;
+                            break :blk .decorator;
+                        }
+                    },
+                    .attr_name => {
+                        if (token.type == .name) {
+                            meta_state = .attr_value;
+                            break :blk .decorator;
+                        }
+                        meta_state = .none;
+                    },
+                    .attr_value => {
+                        if (token.type == .equal) {
+                            break :blk .operator;
+                        } else if (token.type == .leftParen) {
+                            meta_state = .group_key;
+                            break :blk .operator;
+                        } else if (token.type == .hash or token.type == .hashBang) {
+                            meta_state = .attr_name;
+                            break :blk .decorator;
+                        } else if (token.type == .line) {
+                            meta_state = .none;
+                        } else {
+                            meta_state = .none;
+                        }
+                    },
+                    .group_key => {
+                        if (token.type == .name) {
+                            meta_state = .group_value;
+                            break :blk .property;
+                        } else if (token.type == .rightParen) {
+                            meta_state = .none;
+                            break :blk .operator;
+                        } else if (token.type == .comma) {
+                            break :blk .operator;
+                        } else if (token.type == .line) {
+                            // Groups can span multiple lines
+                        }
+                    },
+                    .group_value => {
+                        if (token.type == .equal) {
+                            break :blk .operator;
+                        } else if (token.type == .comma) {
+                            meta_state = .group_key;
+                            break :blk .operator;
+                        } else if (token.type == .rightParen) {
+                            meta_state = .none;
+                            break :blk .operator;
+                        } else if (token.type == .line) {
+                            // Groups can span multiple lines; stay in group_key state
+                            meta_state = .group_key;
+                        }
+                    },
+                }
+                break :blk tokenTagToSemanticType(token.type) orelse continue;
+            };
 
             const start_line_num = doc.source_file.lineAt(token.start);
             const start_line: u32 = if (start_line_num > 0) @intCast(start_line_num - 1) else 0;
@@ -4083,7 +5220,6 @@ pub const Handler = struct {
 
         var symbols: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
 
-        // Extract symbols from module AST
         for (doc.module.statements) |stmt| {
             switch (stmt) {
                 .ClassStmt => |class_stmt| {
@@ -4091,7 +5227,6 @@ pub const Handler = struct {
                         const range = tokenToRange(name_token);
                         const class_name = try arena.dupe(u8, name_token.name());
 
-                        // Collect methods first
                         var method_children: std.ArrayListUnmanaged(types.DocumentSymbol) = .empty;
                         for (class_stmt.methods) |method_node| {
                             if (method_node == .Method) {
@@ -4101,6 +5236,7 @@ pub const Handler = struct {
                                     const method_range = tokenToRange(method_name);
                                     try method_children.append(arena, .{
                                         .name = method_name_str,
+                                        .detail = formatMeta(arena, method.meta),
                                         .kind = .Method,
                                         .range = method_range,
                                         .selectionRange = method_range,
@@ -4111,6 +5247,7 @@ pub const Handler = struct {
 
                         try symbols.append(arena, .{
                             .name = class_name,
+                            .detail = formatMeta(arena, class_stmt.meta),
                             .kind = .Class,
                             .range = range,
                             .selectionRange = range,
@@ -4124,6 +5261,7 @@ pub const Handler = struct {
                         const var_name = try arena.dupe(u8, name_token.name());
                         try symbols.append(arena, .{
                             .name = var_name,
+                            .detail = formatMeta(arena, var_stmt.meta),
                             .kind = .Variable,
                             .range = range,
                             .selectionRange = range,
@@ -4135,6 +5273,56 @@ pub const Handler = struct {
         }
 
         return .{ .array_of_DocumentSymbol = symbols.items };
+    }
+
+    fn formatMeta(arena: std.mem.Allocator, meta: ?*const wrenalyzer.Ast.Meta) ?[]const u8 {
+        const m = meta orelse return null;
+        if (m.isEmpty()) return null;
+
+        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (m.attrs) |attr| {
+            const attr_name = attr.name_tok.name();
+            for (attr.occurrences) |occ| {
+                const prefix: []const u8 = if (occ.introducer.type == .hashBang) "#!" else "#";
+                const part = switch (occ.value) {
+                    .none => std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, attr_name }) catch continue,
+                    .expr => |expr| blk: {
+                        const val = exprToString(expr);
+                        break :blk std.fmt.allocPrint(arena, "{s}{s} = {s}", .{ prefix, attr_name, val }) catch continue;
+                    },
+                    .group => |group| blk: {
+                        var entries: std.ArrayListUnmanaged([]const u8) = .empty;
+                        for (group.items) |item| {
+                            for (item.entries) |entry| {
+                                const key = entry.key_tok.name();
+                                if (entry.value) |v| {
+                                    const val = exprToString(v);
+                                    entries.append(arena, std.fmt.allocPrint(arena, "{s} = {s}", .{ key, val }) catch continue) catch continue;
+                                } else {
+                                    entries.append(arena, key) catch continue;
+                                }
+                            }
+                        }
+                        const joined = std.mem.join(arena, ", ", entries.items) catch continue;
+                        break :blk std.fmt.allocPrint(arena, "{s}{s}({s})", .{ prefix, attr_name, joined }) catch continue;
+                    },
+                };
+                parts.append(arena, part) catch continue;
+            }
+        }
+
+        if (parts.items.len == 0) return null;
+        return std.mem.join(arena, " ", parts.items) catch null;
+    }
+
+    fn exprToString(node: wrenalyzer.Ast.Node) []const u8 {
+        return switch (node) {
+            .StringExpr => |s| s.value.name(),
+            .NumExpr => |n| n.value.name(),
+            .BoolExpr => |b| if (b.value) "true" else "false",
+            .NullExpr => "null",
+            else => "?",
+        };
     }
 
     pub fn @"textDocument/inlayHint"(

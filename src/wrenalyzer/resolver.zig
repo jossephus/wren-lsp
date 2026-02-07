@@ -686,6 +686,10 @@ fn checkUserMethodArity(self: *Resolver, receiver: *const ast.Node, expr: ast.Ca
     }
 
     if (self.findClassStmt(module, class_info.name)) |class_stmt| {
+        if (class_info.is_static and std.mem.eql(u8, call_name, "attributes") and arg_count == 0) {
+            if (classHasRuntimeMeta(class_stmt)) return;
+        }
+
         const methods = extractMethodsFromAst(self.allocator, class_stmt.methods) orelse return;
         defer self.allocator.free(methods);
 
@@ -755,6 +759,13 @@ fn findClassStmt(self: *Resolver, module: *ast.Module, class_name: []const u8) ?
         }
     }
     return null;
+}
+
+fn classHasRuntimeMeta(class_stmt: ast.ClassStmt) bool {
+    if (class_stmt.meta) |meta| {
+        return meta.hasRuntimeAttrs();
+    }
+    return false;
 }
 
 fn receiverInferredType(self: *Resolver, receiver: *const ast.Node) ?Scope.Symbol.InferredType {

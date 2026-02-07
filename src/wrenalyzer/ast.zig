@@ -170,6 +170,16 @@ pub const Meta = struct {
     pub fn isEmpty(self: *const Meta) bool {
         return self.attrs.len == 0;
     }
+
+    pub fn hasRuntimeAttrs(self: *const Meta) bool {
+        const Tag = @import("token.zig").Token.Tag;
+        for (self.attrs) |attr| {
+            for (attr.occurrences) |occ| {
+                if (occ.introducer.type == Tag.hashBang) return true;
+            }
+        }
+        return false;
+    }
 };
 
 pub const Body = struct {
