@@ -1473,11 +1473,6 @@ pub const Handler = struct {
                         continue;
                     }
 
-                    // Skip scheme-prefixed imports (e.g., "http:", "hl:")
-                    if (hasSchemePrefix(raw_path)) {
-                        continue;
-                    }
-
                     var resolved_uri: ?[]const u8 = null;
                     var import_found = false;
 
@@ -1505,7 +1500,7 @@ pub const Handler = struct {
                             }
                         }
                     } else {
-                        if (!isImportFilePath(raw_path)) continue;
+                        if (!isImportFilePath(raw_path) or hasSchemePrefix(raw_path)) continue;
 
                         const base_path = uriToPath(uri);
                         const base_dir = std.fs.path.dirname(base_path) orelse base_path;

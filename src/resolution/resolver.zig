@@ -122,15 +122,7 @@ pub const ResolverChain = struct {
             return null;
         }
 
-        if (self.config.resolvers.len > 0 or self.config.modules.len > 0) {
-            return null;
-        }
-
-        return ResolveResult{
-            .canonical_id = std.fmt.allocPrint(self.allocator, "wren://virtual/{s}", .{request.import_string}) catch return null,
-            .uri = null,
-            .kind = .virtual,
-        };
+        return null;
     }
 };
 

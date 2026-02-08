@@ -73,10 +73,9 @@ test "resolver chain uses default path resolver" {
         .project_root = "/tmp/test",
     };
 
-    // Will return virtual fallback for non-existent module
+    // Returns null for non-existent module (no virtual fallback)
     const result = chain.resolve(request);
-    try std.testing.expect(result != null);
-    try std.testing.expect(result.?.kind == .virtual);
+    try std.testing.expect(result == null);
 }
 
 test "path resolver with delimiter converts dots to slashes" {
