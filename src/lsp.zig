@@ -11,6 +11,7 @@ const Token = wrenalyzer.Token;
 const Scope = wrenalyzer.Scope;
 
 const resolution = @import("resolution/root.zig");
+const uri_util = @import("uri.zig");
 const ConfigLoader = resolution.ConfigLoader;
 const ResolverChain = resolution.ResolverChain;
 const ResolveRequest = resolution.ResolveRequest;
@@ -1411,7 +1412,7 @@ pub const Handler = struct {
         const base_dir = std.fs.path.dirname(base_path) orelse base_path;
         const with_ext = try ensureWrenExtension(arena, import_path);
         const joined = try std.fs.path.join(arena, &.{ base_dir, with_ext });
-        return std.fmt.allocPrint(arena, "file://{s}", .{joined});
+        return uri_util.pathToUri(arena, joined);
     }
 
     fn isIdentChar(c: u8) bool {
@@ -1429,19 +1430,7 @@ pub const Handler = struct {
         return value;
     }
 
-    fn uriToPath(uri: []const u8) []const u8 {
-        const prefix = "file://";
-        if (std.mem.startsWith(u8, uri, prefix)) {
-            var path = uri[prefix.len..];
-            // On Windows, file URIs are file:///C:/path, which becomes /C:/path
-            // We need to remove the leading / on Windows
-            if (builtin.os.tag == .windows and path.len > 2 and path[0] == '/' and path[2] == ':') {
-                return path[1..];
-            }
-            return path;
-        }
-        return uri;
-    }
+    const uriToPath = uri_util.uriToPath;
 
     fn ensureWrenExtension(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
         if (std.mem.endsWith(u8, path, ".wren")) return path;
@@ -1515,7 +1504,7 @@ pub const Handler = struct {
 
                         if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
                             import_found = true;
-                            resolved_uri = std.fmt.allocPrint(self.gpa, "file://{s}", .{full_path}) catch null;
+                            resolved_uri = uri_util.pathToUri(self.gpa, full_path) catch null;
                         } else |_| {}
                     }
 
@@ -1881,7 +1870,8 @@ pub const Handler = struct {
         const config_path = try std.fs.path.join(arena, &.{ dir_path, "wren-lsp.json" });
 
         if (std.fs.cwd().access(config_path, .{ .mode = .read_only })) |_| {
-            const dummy_uri = try std.fmt.allocPrint(arena, "file://{s}/dummy.wren", .{dir_path});
+            const dummy_path = try std.fs.path.join(arena, &.{ dir_path, "dummy.wren" });
+            const dummy_uri = try uri_util.pathToUri(arena, dummy_path);
             const config = self.config_loader.loadForFile(dummy_uri) catch return;
             const module_dirs = resolution.ModuleEntry.extractDirectories(arena, config.modules) catch &.{};
 
@@ -1933,7 +1923,7 @@ pub const Handler = struct {
             switch (entry.kind) {
                 .file => {
                     if (std.mem.endsWith(u8, entry.name, ".wren")) {
-                        const uri = try std.fmt.allocPrint(arena, "file://{s}", .{full_path});
+                        const uri = try uri_util.pathToUri(arena, full_path);
 
                         if (self.files.get(uri) == null) {
                             self.loadImportedFile(uri) catch |err| {

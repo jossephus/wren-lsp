@@ -11,6 +11,7 @@ const ResolveRequest = types.ResolveRequest;
 const ResolveResult = types.ResolveResult;
 const ResolverConfig = types.ResolverConfig;
 const ResolverKind = types.ResolverKind;
+const uri_util = @import("../uri.zig");
 
 pub const log = std.log.scoped(.wren_lsp_resolver);
 
@@ -228,8 +229,8 @@ pub const PathResolver = struct {
                 const real_path = std.fs.cwd().realpathAlloc(allocator, resolved_path) catch return null;
                 defer allocator.free(real_path);
                 return ResolveResult{
-                    .canonical_id = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
-                    .uri = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
+                    .canonical_id = uri_util.pathToUri(allocator, real_path) catch return null,
+                    .uri = uri_util.pathToUri(allocator, real_path) catch return null,
                     .kind = .file,
                 };
             } else |_| {}
@@ -254,8 +255,8 @@ pub const PathResolver = struct {
 
         if (std.fs.cwd().access(with_ext, .{ .mode = .read_only })) |_| {
             return ResolveResult{
-                .canonical_id = std.fmt.allocPrint(allocator, "file://{s}", .{with_ext}) catch return null,
-                .uri = std.fmt.allocPrint(allocator, "file://{s}", .{with_ext}) catch return null,
+                .canonical_id = uri_util.pathToUri(allocator, with_ext) catch return null,
+                .uri = uri_util.pathToUri(allocator, with_ext) catch return null,
                 .kind = .file,
             };
         } else |_| {}
@@ -267,10 +268,10 @@ pub const PathResolver = struct {
         const base_dir = if (self.project_root) |pr| pr else ".";
         const import_str = request.import_string;
 
-        // Convert delimiter to path separator if delimiter is not "/"
-        const path_str_allocated = !std.mem.eql(u8, self.delimiter, "/") and std.mem.indexOf(u8, import_str, self.delimiter) != null;
+        // Convert delimiter to platform path separator
+        const path_str_allocated = !std.mem.eql(u8, self.delimiter, std.fs.path.sep_str) and std.mem.indexOf(u8, import_str, self.delimiter) != null;
         const path_str = if (path_str_allocated)
-            std.mem.replaceOwned(u8, allocator, import_str, self.delimiter, "/") catch return null
+            std.mem.replaceOwned(u8, allocator, import_str, self.delimiter, std.fs.path.sep_str) catch return null
         else
             import_str;
         defer if (path_str_allocated) allocator.free(path_str);
@@ -306,8 +307,8 @@ pub const PathResolver = struct {
             const real_path = std.fs.cwd().realpathAlloc(allocator, full_path) catch return null;
             defer allocator.free(real_path);
             return ResolveResult{
-                .canonical_id = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
-                .uri = std.fmt.allocPrint(allocator, "file://{s}", .{real_path}) catch return null,
+                .canonical_id = uri_util.pathToUri(allocator, real_path) catch return null,
+                .uri = uri_util.pathToUri(allocator, real_path) catch return null,
                 .kind = .file,
             };
         } else |_| {}
@@ -560,10 +561,4 @@ fn parseDiagnosticSeverityString(value: []const u8) ?ResolveResult.Diagnostic.Se
     return null;
 }
 
-fn uriToPath(uri: []const u8) []const u8 {
-    const prefix = "file://";
-    if (std.mem.startsWith(u8, uri, prefix)) {
-        return uri[prefix.len..];
-    }
-    return uri;
-}
+const uriToPath = uri_util.uriToPath;

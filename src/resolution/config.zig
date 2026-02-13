@@ -8,6 +8,7 @@ const types = @import("types.zig");
 const Config = types.Config;
 const ResolverConfig = types.ResolverConfig;
 const ResolverKind = types.ResolverKind;
+const uri_util = @import("../uri.zig");
 
 pub const log = std.log.scoped(.wren_lsp_config);
 
@@ -469,13 +470,7 @@ pub fn freeConfig(backing_allocator: std.mem.Allocator, cfg: *Config) void {
     cfg.deinit(backing_allocator);
 }
 
-fn uriToPath(uri: []const u8) []const u8 {
-    const prefix = "file://";
-    if (std.mem.startsWith(u8, uri, prefix)) {
-        return uri[prefix.len..];
-    }
-    return uri;
-}
+const uriToPath = uri_util.uriToPath;
 
 test "parse empty config" {
     var loader = ConfigLoader.init(std.testing.allocator);
