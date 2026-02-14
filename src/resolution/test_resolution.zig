@@ -61,7 +61,7 @@ test "resolver chain uses default path resolver" {
     const arena = arena_state.allocator();
 
     const cfg = types.Config{
-        .modules = &.{"./src"},
+        .modules = &.{.{ .directory = "./src" }},
         .project_root = "/tmp/test",
     };
 
@@ -109,25 +109,29 @@ test "parser finds both classes and top-level vars" {
         \\var anotherVar = Fn.new {}
     ;
 
-    var doc = try wrenalyzer.Ast.initFromSource(std.testing.allocator, src, null);
-    defer doc.deinit(std.testing.allocator);
+    var source_file = try wrenalyzer.SourceFile.new(std.testing.allocator, "test.wren", src);
+    defer source_file.deinit();
+    const lexer = try wrenalyzer.Lexer.new(std.testing.allocator, &source_file);
+    var parser = try wrenalyzer.Parser.new(std.testing.allocator, lexer);
+    defer parser.deinit();
+    const module = try parser.parseModule();
 
     var class_count: usize = 0;
     var var_count: usize = 0;
-    var class_names = std.ArrayList([]const u8).init(std.testing.allocator);
-    defer class_names.deinit();
-    var var_names = std.ArrayList([]const u8).init(std.testing.allocator);
-    defer var_names.deinit();
+    var class_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer class_names.deinit(std.testing.allocator);
+    var var_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer var_names.deinit(std.testing.allocator);
 
-    for (doc.module.statements) |stmt| {
+    for (module.statements) |stmt| {
         switch (stmt) {
             .ClassStmt => |cs| {
                 class_count += 1;
-                if (cs.name) |n| try class_names.append(n.name());
+                if (cs.name) |n| try class_names.append(std.testing.allocator, n.name());
             },
             .VarStmt => |vs| {
                 var_count += 1;
-                if (vs.name) |n| try var_names.append(n.name());
+                if (vs.name) |n| try var_names.append(std.testing.allocator, n.name());
             },
             else => {},
         }

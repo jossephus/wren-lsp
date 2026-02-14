@@ -1,0 +1,57 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  zig-tests:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            run_wren: true
+          - os: macos-latest
+            run_wren: false
+          - os: windows-latest
+            run_wren: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        if: runner.os != 'Windows'
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Install Zig
+        if: runner.os == 'Windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run LSP tests (Nix)
+        if: runner.os != 'Windows'
+        run: nix develop -c zig build test-lsp
+
+      - name: Run LSP tests (Windows)
+        if: runner.os == 'Windows'
+        run: zig build test-lsp
+
+      - name: Run Wren test suite
+        if: runner.os != 'Windows' && matrix.run_wren
+        run: nix develop -c zig build test-wren
+
+      - name: Run unit tests
+        if: runner.os != 'Windows'
+        run: nix develop -c zig build test
+
+      - name: Run unit tests (Windows)
+        if: runner.os == 'Windows'
+        run: zig build test

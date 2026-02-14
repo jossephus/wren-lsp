@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_run = b.option(bool, "skip-run", "Skip running test executables") orelse false;
 
     const lsp = buildLsp(b, target, optimize);
 
@@ -44,6 +45,30 @@ pub fn build(b: *std.Build) !void {
 
     const run_tests_step = b.step("test-wren", "Run parser tests against wren test suite");
     run_tests_step.dependOn(&run_tests_cmd.step);
+
+    // LSP feature tests
+    const lsp_dep = b.dependency("lsp_kit", .{});
+    const wrenalyzer_mod = build_wren_analyzer(b, target, optimize);
+
+    const lsp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/lsp_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_test_mod.addImport("wrenalyzer", wrenalyzer_mod);
+    lsp_test_mod.addImport("lsp", lsp_dep.module("lsp"));
+
+    const lsp_tests = b.addTest(.{
+        .root_module = lsp_test_mod,
+    });
+
+    const lsp_test_step = b.step("test-lsp", "Run LSP feature tests");
+    if (skip_run) {
+        lsp_test_step.dependOn(&lsp_tests.step);
+    } else {
+        const run_lsp_tests = b.addRunArtifact(lsp_tests);
+        lsp_test_step.dependOn(&run_lsp_tests.step);
+    }
 
     const fmt_step = b.step("fmt", "Format Zig files");
     const fmt_zig = b.addFmt(.{
