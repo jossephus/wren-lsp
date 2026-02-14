@@ -768,11 +768,32 @@ fn finishBody(self: *Parser, parameters: []Token) Node {
     if (self.match(Tag.rightBrace) != null) return .{ .Body = ast.Body.init(parameters, null, empty_stmts) };
 
     if (!self.matchLine()) {
-        const expr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
-        expr.* = self.expression();
+        const node = self.statement();
         self.ignoreLine();
         _ = self.consume(Tag.rightBrace, "Expect '}' at end of block.");
-        return .{ .Body = ast.Body.init(parameters, expr, null) };
+
+        switch (node) {
+            .BreakStmt,
+            .ContinueStmt,
+            .IfStmt,
+            .ForStmt,
+            .WhileStmt,
+            .ReturnStmt,
+            .BlockStmt,
+            .VarStmt,
+            .ImportStmt,
+            .ClassStmt,
+            => {
+                const stmt = self.alloc().alloc(ast.Node, 1) catch @panic("Error allocating memory");
+                stmt[0] = node;
+                return .{ .Body = ast.Body.init(parameters, null, stmt) };
+            },
+            else => {
+                const expr = self.alloc().create(ast.Node) catch @panic("Error allocating memory");
+                expr.* = node;
+                return .{ .Body = ast.Body.init(parameters, expr, null) };
+            },
+        }
     }
 
     const empty_stmts2 = self.alloc().alloc(ast.Node, 0) catch @panic("Error allocating memory");
@@ -1177,6 +1198,52 @@ test "#3 - parser and resolver handle hi() inside class method" {
             try std.testing.expect(false);
         }
     }
+}
+
+test "#3 - one-line return body does not swallow next class method" {
+    const allocator = std.testing.allocator;
+    const code =
+        \\class Animal {
+        \\  speak() { return "..." }
+        \\  move(x) { return x }
+        \\}
+    ;
+
+    var source = try @import("source_file.zig").new(allocator, "test.wren", code);
+    defer source.deinit();
+
+    const lexer = try @import("lexer.zig").Lexer.new(allocator, &source);
+    var parser = try Parser.new(allocator, lexer);
+    defer parser.deinit();
+
+    const module = try parser.parseModule();
+    try std.testing.expectEqual(@as(usize, 1), module.statements.len);
+
+    const class_stmt = switch (module.statements[0]) {
+        .ClassStmt => |c| c,
+        else => unreachable,
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), class_stmt.methods.len);
+
+    const first_method = switch (class_stmt.methods[0]) {
+        .Method => |m| m,
+        else => unreachable,
+    };
+    const second_method = switch (class_stmt.methods[1]) {
+        .Method => |m| m,
+        else => unreachable,
+    };
+
+    try std.testing.expectEqualStrings("speak", first_method.name.?.name());
+    try std.testing.expectEqualStrings("move", second_method.name.?.name());
+    try std.testing.expectEqual(@as(usize, 1), first_method.body.len);
+
+    const first_stmt = switch (first_method.body[0]) {
+        .ReturnStmt => |stmt| stmt,
+        else => unreachable,
+    };
+    try std.testing.expect(first_stmt.value != null);
 }
 
 test "#4 - bare identifier reference should error if undefined" {

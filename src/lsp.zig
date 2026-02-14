@@ -5487,6 +5487,7 @@ pub const Handler = struct {
 
         const lexer = try wrenalyzer.Lexer.new(self.gpa, source_file);
         var parser = try wrenalyzer.Parser.newWithReporter(self.gpa, lexer, &reporter);
+        defer parser.deinit();
         const module = try parser.parseModule();
 
         // Process each import statement

@@ -42,6 +42,7 @@ bytes: []const u8,
 src: [:0]const u8,
 language: lsp_namespace.Language,
 source_file: *SourceFile,
+parser: *Parser,
 reporter: Reporter,
 symbols: std.ArrayListUnmanaged(SymbolInfo),
 refs: std.ArrayListUnmanaged(ResolvedRef) = .empty,
@@ -68,6 +69,8 @@ pub fn deinit(doc: *Document, gpa: std.mem.Allocator) void {
         }
     }
     doc.exports.deinit(gpa);
+    doc.parser.deinit();
+    gpa.destroy(doc.parser);
     doc.source_file.deinit();
     gpa.destroy(doc.source_file);
 }
@@ -90,12 +93,17 @@ pub fn initWithImportSymbols(
     const bytes = code_point_iterator.bytes;
 
     const source_file = try gpa.create(SourceFile);
+    errdefer gpa.destroy(source_file);
     source_file.* = try SourceFile.new(gpa, "index.wren", src);
+    errdefer source_file.deinit();
 
     var reporter = Reporter.init(gpa);
 
     const lexer = try Lexer.new(gpa, source_file);
-    var parser = try Parser.newWithReporter(gpa, lexer, &reporter);
+    const parser = try gpa.create(Parser);
+    errdefer gpa.destroy(parser);
+    parser.* = try Parser.newWithReporter(gpa, lexer, &reporter);
+    errdefer parser.deinit();
     var module = try parser.parseModule();
 
     var symbols: std.ArrayListUnmanaged(SymbolInfo) = .empty;
@@ -109,6 +117,7 @@ pub fn initWithImportSymbols(
             .language = language,
             .bytes = bytes,
             .source_file = source_file,
+            .parser = parser,
             .module = module,
             .reporter = reporter,
             .symbols = symbols,
@@ -175,6 +184,7 @@ pub fn initWithImportSymbols(
         .language = language,
         .bytes = bytes,
         .source_file = source_file,
+        .parser = parser,
         .module = module,
         .reporter = reporter,
         .symbols = symbols,
