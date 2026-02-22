@@ -23,6 +23,9 @@ async function ensureWasm() {
 
   const { instance } = await WebAssembly.instantiate(bytes, {
     wasi_snapshot_preview1: wasi.wasiImport,
+    env: {
+      memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
+    },
   });
 
   wasi.inst = instance;
@@ -30,16 +33,29 @@ async function ensureWasm() {
 }
 
 self.addEventListener("message", async (event: MessageEvent) => {
-  const { token, source } = event.data as { token: number; source: string };
-
-  try {
-    await ensureWasm();
-
-    const encoded = encoder.encode(source);
-    const ptr = wasm.allocSource(encoded.length);
-    new Uint8Array(wasm.memory.buffer).set(encoded, ptr);
-
-    const result = wasm.runCode();
+   const { token, source, virtualFiles } = event.data as { token: number; source: string; virtualFiles?: Record<string, string> };
+ 
+   try {
+     await ensureWasm();
+ 
+     // Register virtual files
+     if (virtualFiles) {
+       for (const [path, content] of Object.entries(virtualFiles)) {
+         const pathEncoded = encoder.encode(path);
+         const contentEncoded = encoder.encode(content);
+         const pathPtr = wasm.allocVirtualFilePath(pathEncoded.length);
+         const contentPtr = wasm.allocVirtualFileContent(contentEncoded.length);
+         new Uint8Array(wasm.memory.buffer).set(pathEncoded, pathPtr);
+         new Uint8Array(wasm.memory.buffer).set(contentEncoded, contentPtr);
+         wasm.setVirtualFile();
+       }
+     }
+ 
+     const encoded = encoder.encode(source);
+     const ptr = wasm.allocSource(encoded.length);
+     new Uint8Array(wasm.memory.buffer).set(encoded, ptr);
+ 
+     const result = wasm.runCode();
 
     const outputPtr = wasm.getOutputPtr();
     const outputLen = wasm.getOutputLen();

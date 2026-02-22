@@ -212,13 +212,17 @@ function initRunWorker() {
 }
 
 function runCode(source: string): Promise<{ output: string; errors: string; result: number }> {
-  if (!runWorker) initRunWorker();
-  return new Promise((resolve) => {
-    const token = ++runTokenCounter;
-    runPending.set(token, { resolve });
-    runWorker!.postMessage({ token, source });
-  });
-}
+   if (!runWorker) initRunWorker();
+   return new Promise((resolve) => {
+     const token = ++runTokenCounter;
+     runPending.set(token, { resolve });
+     const virtualFiles: Record<string, string> = {};
+     for (const file of files) {
+       virtualFiles[file.uri] = file.content;
+     }
+     runWorker!.postMessage({ token, source, virtualFiles });
+   });
+ }
 
 const runBtn = document.getElementById("run-btn") as HTMLButtonElement;
 const outputEl = document.getElementById("output") as HTMLDivElement;
