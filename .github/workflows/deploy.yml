@@ -17,10 +17,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build WASM
+        run: nix develop -c zig build wasm
+
+      - name: Build docs
+        run: cd docs && nix develop -c sh -c 'bun install && bun run build'
+
       - name: Deploy to Github Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs/
+          publish_dir: ./docs/dist/
           publish_branch: gh-pages
           destination_dir: .

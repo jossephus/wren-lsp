@@ -23,6 +23,7 @@
         };
         packages = with pkgs; [
           zigpkgs."0.15.2"
+          pkgs.bun
         ];
       in {
         devShell = pkgs.mkShell {

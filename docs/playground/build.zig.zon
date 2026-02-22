@@ -1,0 +1,17 @@
+.{
+    .name = .wren_runner,
+    .fingerprint = 0xc36698b9087151,
+    .minimum_zig_version = "0.15.2",
+    .version = "0.1.0",
+    .dependencies = .{
+        .wren = .{
+            .url = "https://github.com/wren-lang/wren/archive/refs/heads/main.zip",
+            .hash = "N-V-__8AABrrYgAuUm9lX6RLXD_TZcXWng8x6QXaM1o8S4IB",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
