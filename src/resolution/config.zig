@@ -120,6 +120,8 @@ pub const ConfigLoader = struct {
                     norm_resolvers[i].path.roots = try norm_roots.toOwnedSlice(arena);
                 } else if (resolver.kind == .plugin and resolver.plugin.library.len > 0) {
                     norm_resolvers[i].plugin.library = try joinAndNormalize(arena, base_dir, resolver.plugin.library);
+                } else if (resolver.kind == .host and resolver.host.script.len > 0) {
+                    norm_resolvers[i].host.script = try joinAndNormalize(arena, base_dir, resolver.host.script);
                 }
             }
             config.resolvers = norm_resolvers;
@@ -306,6 +308,16 @@ fn parseResolverAlloc(value: std.json.Value, arena: std.mem.Allocator) !?Resolve
             }
             if (obj.get("fallbackToBuiltin")) |v| {
                 if (v == .bool) config.plugin.fallback_to_builtin = v.bool;
+            }
+        },
+        .host => {
+            if (obj.get("script")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    config.host.script = try arena.dupe(u8, v.string);
+                }
+            }
+            if (obj.get("fallbackToBuiltin")) |v| {
+                if (v == .bool) config.host.fallback_to_builtin = v.bool;
             }
         },
     }

@@ -111,11 +111,13 @@ pub const ModuleEntry = union(enum) {
 pub const ResolverKind = enum {
     path,
     plugin,
+    host,
 
     pub fn fromString(s: []const u8) ?ResolverKind {
         const map = std.StaticStringMap(ResolverKind).initComptime(.{
             .{ "path", .path },
             .{ "plugin", .plugin },
+            .{ "host", .host },
         });
         return map.get(s);
     }
@@ -133,11 +135,18 @@ pub const PluginResolverConfig = struct {
     fallback_to_builtin: bool = true,
 };
 
+/// Host resolver configuration.
+pub const HostResolverConfig = struct {
+    script: []const u8 = "",
+    fallback_to_builtin: bool = true,
+};
+
 /// Union of all resolver configurations.
 pub const ResolverConfig = struct {
     kind: ResolverKind,
     path: PathResolverConfig = .{},
     plugin: PluginResolverConfig = .{ .library = "" },
+    host: HostResolverConfig = .{},
 };
 
 /// Top-level wren-lsp.json configuration.

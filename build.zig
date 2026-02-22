@@ -70,6 +70,39 @@ pub fn build(b: *std.Build) !void {
         lsp_test_step.dependOn(&run_lsp_tests.step);
     }
 
+    // WASM playground
+    const wasm_step = b.step("wasm", "Build WASM module for the playground");
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .wasi,
+    });
+    const wasm_wrenalyzer = b.createModule(.{
+        .root_source_file = b.path("src/wrenalyzer/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_mod.addImport("wrenalyzer", wasm_wrenalyzer);
+    wasm_mod.addImport("lsp", lsp_dep.module("lsp"));
+    const wasm_lib = b.addExecutable(.{
+        .name = "wren-playground",
+        .root_module = wasm_mod,
+    });
+    wasm_lib.entry = .disabled;
+    wasm_lib.rdynamic = true;
+    const wasm_install = b.addInstallArtifact(wasm_lib, .{});
+
+    const sync_wasm_to_docs = b.addSystemCommand(&.{ "cp", "-f" });
+    sync_wasm_to_docs.addFileArg(wasm_lib.getEmittedBin());
+    sync_wasm_to_docs.addArg("docs/playground/wren-playground.wasm");
+    sync_wasm_to_docs.step.dependOn(&wasm_install.step);
+
+    wasm_step.dependOn(&sync_wasm_to_docs.step);
+
     const fmt_step = b.step("fmt", "Format Zig files");
     const fmt_zig = b.addFmt(.{
         .paths = &.{ "src", "build.zig" },

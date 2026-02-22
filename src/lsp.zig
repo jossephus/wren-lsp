@@ -227,6 +227,8 @@ pub const Handler = struct {
         return null;
     }
 
+    pub fn exit(_: *Handler, _: std.mem.Allocator, _: void) void {}
+
     pub fn @"textDocument/didOpen"(
         self: *Handler,
         arena: std.mem.Allocator,
