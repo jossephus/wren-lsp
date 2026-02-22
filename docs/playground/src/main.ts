@@ -39,10 +39,12 @@ System.print("Hello World")
     id: "dome.wren",
     uri: "file:///playground/dome.wren",
     language: "wren",
-    content: `// The below config files wren-lsp.json and the custom resolver.js enable
-// us to import declaring our own resolving mechanisms.
-// resolver.js uses github link for dome to resolve files
-// This works fine because wren-lsp configuration is configurable host wise (although we are doing a little bit too much for the wasm, this is in order to show the capability)
+    content: `/// The wren-lsp.json configuration file and resolver.js enable custom
+/// import resolution mechanisms. The resolver.js below uses GitHub links to resolve
+/// dome modules. This works because wren-lsp configuration is host-agnostic.
+///
+/// for this to work on wasm, i am doing a little bit too much work, but its in order to
+/// demonstrate what's possible.
 
 import "input" for Keyboard
 import "graphics" for Canvas, Color

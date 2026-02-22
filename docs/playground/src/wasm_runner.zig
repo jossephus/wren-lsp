@@ -19,6 +19,7 @@ fn noopLog(
 var output_buf: std.ArrayListUnmanaged(u8) = .empty;
 var error_buf: std.ArrayListUnmanaged(u8) = .empty;
 var source_buf: std.ArrayListUnmanaged(u8) = .empty;
+var dummy_byte: u8 = 0;
 
 fn writeFn(_: ?*c.WrenVM, text: [*c]const u8) callconv(.c) void {
     if (text) |t| {
@@ -80,7 +81,7 @@ export fn runCode() u32 {
 }
 
 export fn getOutputPtr() [*]const u8 {
-    if (output_buf.items.len == 0) return @ptrFromInt(0);
+    if (output_buf.items.len == 0) return @ptrCast(&dummy_byte);
     return output_buf.items.ptr;
 }
 
@@ -89,7 +90,7 @@ export fn getOutputLen() usize {
 }
 
 export fn getErrorPtr() [*]const u8 {
-    if (error_buf.items.len == 0) return @ptrFromInt(0);
+    if (error_buf.items.len == 0) return @ptrCast(&dummy_byte);
     return error_buf.items.ptr;
 }
 

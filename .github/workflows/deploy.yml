@@ -25,6 +25,12 @@ jobs:
       - name: Build WASM
         run: nix develop -c zig build wasm
 
+      - name: Build Wren Runner
+        run: cd docs/playground && nix develop -c zig build
+
+      - name: Copy WASM to docs public
+        run: mkdir -p docs/public && cp docs/playground/wren-playground.wasm docs/public/wren-playground.wasm && cp docs/playground/wren-runner.wasm docs/public/wren-runner.wasm
+
       - name: Build docs
         run: cd docs && nix develop -c sh -c 'bun install && bun run build'
 
