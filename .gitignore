@@ -7,3 +7,5 @@ plan.md
 
 .DS_Store
 examples/samples
+node_modules/
+docs/playground/dist/

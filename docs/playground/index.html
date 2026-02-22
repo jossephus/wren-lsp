@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wren LSP Playground</title>
+    <link rel="stylesheet" href="../style.css" />
+    <style>
+      html, body {
+        height: 100%;
+        padding: 0;
+        margin: 0;
+      }
+
+      main {
+        max-width: 1200px;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        margin: 0 auto;
+        padding: 0 20px;
+      }
+
+      .playground-header {
+        display: flex;
+        align-items: center;
+        gap: 0.6em;
+        padding: 0.6em 0;
+        font-size: 0.85em;
+        flex-wrap: wrap;
+      }
+
+      .playground-header a {
+        color: #808080;
+        text-decoration: none;
+      }
+
+      .playground-header a:hover {
+        color: #e0e0e0;
+      }
+
+      .header-sep {
+        color: #333;
+      }
+
+      .header-title {
+        color: #e0e0e0;
+        font-weight: 600;
+      }
+
+      .header-hints {
+        color: #606060;
+        font-size: 0.82em;
+        margin-left: auto;
+      }
+
+      .playground {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto 1fr auto;
+        gap: 0;
+        border: 1px solid #222;
+        border-radius: 6px;
+        background: #111;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      @media (max-width: 700px) {
+        .playground {
+          grid-template-columns: 1fr;
+        }
+        .editor-panel {
+          grid-column: 1;
+        }
+        .diagnostics-panel {
+          grid-column: 1;
+        }
+        .output-panel {
+          grid-column: 1;
+          border-left: none !important;
+        }
+      }
+
+      .editor-panel {
+        grid-row: 2;
+        grid-column: 1 / -1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .diagnostics-panel {
+        grid-row: 3;
+        grid-column: 1;
+        border-top: 1px solid #222;
+        border-right: 1px solid #222;
+      }
+
+      .output-panel {
+        grid-row: 3;
+        grid-column: 2;
+        border-top: 1px solid #222;
+      }
+
+
+
+      .tabs-bar {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        padding: 0.35em 0.5em 0;
+        border-bottom: 1px solid #1a1a1a;
+        overflow-x: auto;
+      }
+
+      .tab {
+        display: flex;
+        align-items: center;
+        gap: 0.35em;
+        padding: 0.35em 0.6em;
+        background: transparent;
+        color: #606060;
+        border: none;
+        cursor: pointer;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 0.8em;
+        border-radius: 3px 3px 0 0;
+        white-space: nowrap;
+      }
+
+      .tab:hover {
+        color: #a0a0a0;
+        background: #1a1a1a;
+      }
+
+      .tab.active {
+        color: #e0e0e0;
+        background: #1a1a1a;
+      }
+
+      .tab-close {
+        background: transparent;
+        border: none;
+        color: #404040;
+        cursor: pointer;
+        font-size: 0.85em;
+        padding: 0 0.15em;
+        border-radius: 2px;
+        line-height: 1;
+      }
+
+      .tab-close:hover {
+        color: #ff6b6b;
+        background: #222;
+      }
+
+      .tab-add-btn {
+        color: #404040;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        font-size: 0.9em;
+        padding: 0.25em 0.5em;
+        border-radius: 3px;
+        margin-left: 0.25em;
+      }
+
+      .tab-add-btn:hover {
+        color: #808080;
+        background: #1a1a1a;
+      }
+
+      #editor {
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+      }
+
+      .config-tabs-bar {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        padding: 0 0.5em 0.35em;
+        border-top: 1px solid #1a1a1a;
+        overflow-x: auto;
+      }
+
+      .diagnostics-panel {
+        grid-row: 3;
+        grid-column: 1;
+        border-top: 1px solid #222;
+        border-right: 1px solid #222;
+      }
+
+      .output-panel {
+        grid-row: 3;
+        grid-column: 2;
+        border-top: 1px solid #222;
+      }
+
+
+
+
+
+      .panel-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75em;
+        padding: 0.5em 0.75em;
+        border-bottom: 1px solid #1a1a1a;
+      }
+
+      .panel-header .panel-label {
+        margin: 0;
+      }
+
+      #diagnostics {
+        padding: 0.75em;
+        max-height: 250px;
+        overflow-y: auto;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 0.8em;
+        line-height: 1.6;
+      }
+
+      #output {
+        padding: 0.75em;
+        max-height: 250px;
+        overflow-y: auto;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 0.8em;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .diag {
+        padding: 0.15em 0;
+      }
+
+      .diag-location {
+        color: #606060;
+      }
+
+      .diag-error {
+        color: #ff6b6b;
+      }
+
+      .diag-warning {
+        color: #ffd93d;
+      }
+
+      .diag-info {
+        color: #6bcbff;
+      }
+
+      .diag-hint {
+        color: #a0a0a0;
+      }
+
+      .output-text {
+        color: #e0e0e0;
+      }
+
+      .output-error {
+        color: #ff6b6b;
+      }
+
+      .output-hint {
+        color: #a0a0a0;
+      }
+
+      .output-running {
+        color: #606060;
+      }
+
+      .status {
+        font-size: 0.75em;
+        color: #404040;
+      }
+
+      .status-ok {
+        color: #4caf50;
+      }
+
+      .run-btn {
+        background: #1a3a1a;
+        color: #4caf50;
+        border: 1px solid #2a5a2a;
+        padding: 0.15em 0.7em;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 0.75em;
+        font-family: inherit;
+        margin-left: auto;
+      }
+
+      .run-btn:hover {
+        background: #2a4a2a;
+      }
+
+      .run-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+
+      <div class="playground-header">
+        <a href="../">← Wren LSP</a>
+        <span class="header-sep">·</span>
+        <span class="header-title">Wren LSP Playground</span>
+        <span class="header-hints"
+          >Ctrl+Space completions · Ctrl+Click go-to-def · F12/Shift+F12
+          def/refs</span
+        >
+      </div>
+
+      <div class="playground">
+        <div class="editor-panel">
+          <div class="tabs-bar" id="tabs-bar">
+            <button class="tab-add-btn" id="tab-add-btn" title="New file">+</button>
+          </div>
+          <div id="editor"></div>
+          <div class="config-tabs-bar" id="config-tabs-bar"></div>
+        </div>
+        <div class="diagnostics-panel">
+          <div class="panel-header">
+            <div class="panel-label">Diagnostics</div>
+            <div class="status" id="status">Loading WASM…</div>
+          </div>
+          <div id="diagnostics"></div>
+        </div>
+        <div class="output-panel">
+          <div class="panel-header">
+            <div class="panel-label">Output</div>
+            <button id="run-btn" class="run-btn" disabled>▶ Run</button>
+          </div>
+          <div id="output">
+            <span class="output-hint">Press ▶ Run or Ctrl+Enter</span>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

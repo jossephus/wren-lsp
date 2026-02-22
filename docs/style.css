@@ -16,7 +16,7 @@ body {
   background: #0a0a0a;
 }
 
-main {
+main.docs-main {
   max-width: 640px;
   margin: 0 auto;
 }
