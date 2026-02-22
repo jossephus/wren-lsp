@@ -4,6 +4,7 @@
 //! to canonical module identifiers and file URIs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const builtins = @import("builtins.zig");
 const Config = types.Config;
@@ -14,6 +15,8 @@ const ResolverKind = types.ResolverKind;
 const uri_util = @import("../uri.zig");
 
 pub const log = std.log.scoped(.wren_lsp_resolver);
+
+const is_wasm_target = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
 
 /// Resolver interface - implemented by each resolver type.
 pub const Resolver = struct {
@@ -70,6 +73,11 @@ pub const ResolverChain = struct {
     }
 
     fn addDefaultResolvers(self: *ResolverChain) !void {
+        if (comptime is_wasm_target) {
+            const host_resolver = try HostResolver.create(self.allocator, .{});
+            try self.resolvers.append(self.allocator, host_resolver);
+        }
+
         const path_resolver = try PathResolver.create(
             self.allocator,
             .{ .delimiter = "/" },
@@ -101,6 +109,11 @@ pub const ResolverChain = struct {
                 resolver.stop_on_null = !cfg.plugin.fallback_to_builtin;
                 break :blk resolver;
             },
+            .host => blk: {
+                var resolver = try HostResolver.create(self.allocator, cfg.host);
+                resolver.stop_on_null = !cfg.host.fallback_to_builtin;
+                break :blk resolver;
+            },
         };
     }
 
@@ -126,6 +139,116 @@ pub const ResolverChain = struct {
         return null;
     }
 };
+
+pub const HostResolver = struct {
+    const Self = @This();
+
+    pub fn create(allocator: std.mem.Allocator, _: types.HostResolverConfig) !Resolver {
+        const self = try allocator.create(Self);
+        self.* = .{};
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .resolve = &resolveImpl,
+                .deinit = &deinitImpl,
+            },
+        };
+    }
+
+    fn resolveImpl(ptr: *anyopaque, allocator: std.mem.Allocator, request: ResolveRequest) ?ResolveResult {
+        _ = ptr;
+        if (comptime !is_wasm_target) return null;
+        return doResolve(allocator, request);
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
+    }
+
+    fn doResolve(allocator: std.mem.Allocator, request: ResolveRequest) ?ResolveResult {
+        var cap: usize = 4096;
+
+        while (cap <= 8 * 1024 * 1024) {
+            const buf = allocator.alloc(u8, cap) catch return null;
+            defer allocator.free(buf);
+
+            const needed = wren_lsp_host_resolve(
+                request.importer_uri.ptr,
+                request.importer_uri.len,
+                request.import_string.ptr,
+                request.import_string.len,
+                request.project_root.ptr,
+                request.project_root.len,
+                buf.ptr,
+                buf.len,
+            );
+
+            if (needed == 0) return null;
+            if (needed > buf.len) {
+                cap = needed;
+                continue;
+            }
+
+            return parseHostResolveResult(allocator, buf[0..needed]);
+        }
+
+        return null;
+    }
+
+    fn parseHostResolveResult(allocator: std.mem.Allocator, json_payload: []const u8) ?ResolveResult {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, json_payload, .{}) catch return null;
+        const root = parsed.value;
+        if (root != .object) return null;
+        const obj = root.object;
+
+        const canonical_id = if (obj.get("canonical_id")) |v|
+            if (v == .string) v.string else return null
+        else if (obj.get("canonicalId")) |v|
+            if (v == .string) v.string else return null
+        else
+            return null;
+
+        const maybe_uri = if (obj.get("uri")) |v|
+            if (v == .string) v.string else null
+        else
+            null;
+
+        const maybe_source = if (obj.get("source")) |v|
+            if (v == .string) v.string else null
+        else
+            null;
+
+        const kind: ResolveResult.ModuleKind = if (obj.get("kind")) |v| blk: {
+            if (v != .string) break :blk if (maybe_source != null) .virtual else .file;
+            if (std.mem.eql(u8, v.string, "virtual")) break :blk .virtual;
+            if (std.mem.eql(u8, v.string, "remote")) break :blk .remote;
+            break :blk .file;
+        } else if (maybe_source != null) .virtual else .file;
+
+        return ResolveResult{
+            .canonical_id = allocator.dupe(u8, canonical_id) catch return null,
+            .uri = if (maybe_uri) |uri| allocator.dupe(u8, uri) catch null else null,
+            .source = if (maybe_source) |source| allocator.dupe(u8, source) catch null else null,
+            .kind = kind,
+        };
+    }
+};
+
+extern fn wren_lsp_host_resolve(
+    importer_ptr: [*]const u8,
+    importer_len: usize,
+    import_ptr: [*]const u8,
+    import_len: usize,
+    project_root_ptr: [*]const u8,
+    project_root_len: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+) usize;
 
 /// Path resolver - treats import strings as file paths.
 /// Supports custom delimiter for dotted imports (e.g., "game.physics" -> "game/physics.wren").
@@ -226,7 +349,7 @@ pub const PathResolver = struct {
             defer allocator.free(resolved_path);
 
             if (std.fs.cwd().access(resolved_path, .{ .mode = .read_only })) |_| {
-                const real_path = std.fs.cwd().realpathAlloc(allocator, resolved_path) catch return null;
+                const real_path = canonicalPath(allocator, resolved_path) orelse return null;
                 defer allocator.free(real_path);
                 return ResolveResult{
                     .canonical_id = uri_util.pathToUri(allocator, real_path) catch return null,
@@ -304,7 +427,7 @@ pub const PathResolver = struct {
         defer allocator.free(full_path);
 
         if (std.fs.cwd().access(full_path, .{ .mode = .read_only })) |_| {
-            const real_path = std.fs.cwd().realpathAlloc(allocator, full_path) catch return null;
+            const real_path = canonicalPath(allocator, full_path) orelse return null;
             defer allocator.free(real_path);
             return ResolveResult{
                 .canonical_id = uri_util.pathToUri(allocator, real_path) catch return null,
@@ -314,6 +437,13 @@ pub const PathResolver = struct {
         } else |_| {}
 
         return null;
+    }
+
+    fn canonicalPath(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+        if (comptime builtin.target.os.tag == .wasi) {
+            return allocator.dupe(u8, path) catch null;
+        }
+        return std.fs.cwd().realpathAlloc(allocator, path) catch null;
     }
 };
 
@@ -393,26 +523,33 @@ pub const PluginResolver = struct {
             .fallback_to_builtin = cfg.fallback_to_builtin,
         };
 
-        const lib_path = resolveLibraryPath(allocator, cfg.library, project_root) orelse {
-            log.warn("Failed to load plugin: could not resolve path", .{});
+        if (comptime is_wasm_target) {
+            log.info("Plugin resolver disabled on wasm target", .{});
             return createResolver(self);
-        };
-        defer allocator.free(lib_path);
+        }
 
-        self.handle = std.DynLib.open(lib_path) catch |err| {
-            log.warn("Failed to load plugin library '{s}': {}", .{ lib_path, err });
-            return createResolver(self);
-        };
+        if (comptime !is_wasm_target) {
+            const lib_path = resolveLibraryPath(allocator, cfg.library, project_root) orelse {
+                log.warn("Failed to load plugin: could not resolve path", .{});
+                return createResolver(self);
+            };
+            defer allocator.free(lib_path);
 
-        if (self.handle) |*h| {
-            self.resolve_fn = h.lookup(ResolveFn, "wren_lsp_resolve_module");
-            self.free_fn = h.lookup(FreeFn, "wren_lsp_free_result");
+            self.handle = std.DynLib.open(lib_path) catch |err| {
+                log.warn("Failed to load plugin library '{s}': {}", .{ lib_path, err });
+                return createResolver(self);
+            };
 
-            if (self.resolve_fn == null) {
-                log.warn("Plugin missing wren_lsp_resolve_module symbol", .{});
-            }
-            if (self.free_fn == null) {
-                log.warn("Plugin missing wren_lsp_free_result symbol", .{});
+            if (self.handle) |*h| {
+                self.resolve_fn = h.lookup(ResolveFn, "wren_lsp_resolve_module");
+                self.free_fn = h.lookup(FreeFn, "wren_lsp_free_result");
+
+                if (self.resolve_fn == null) {
+                    log.warn("Plugin missing wren_lsp_resolve_module symbol", .{});
+                }
+                if (self.free_fn == null) {
+                    log.warn("Plugin missing wren_lsp_free_result symbol", .{});
+                }
             }
         }
 
@@ -463,8 +600,10 @@ pub const PluginResolver = struct {
 
     fn deinitImpl(ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.handle) |*h| {
-            h.close();
+        if (comptime !is_wasm_target) {
+            if (self.handle) |*h| {
+                h.close();
+            }
         }
         allocator.destroy(self);
     }

@@ -1099,7 +1099,6 @@ fn checkMethodArity(
     if (matches_arity) return true;
 
     if (arity_len == 0) {
-        if (is_static and std.mem.eql(u8, call_name, "new")) return true;
         const kind_label = if (is_static) "static" else "instance";
         var buf: [192]u8 = undefined;
         const msg = std.fmt.bufPrint(
