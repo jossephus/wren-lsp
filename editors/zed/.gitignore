@@ -1,0 +1,10 @@
+
+target/
+extension.wasm
+wren-lsp
+wren-lsp.exe
+version.txt
+wren-lsp.tmp
+wren-lsp.exe.tmp
+grammars/*.wasm
+grammars/wren/
