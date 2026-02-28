@@ -24,6 +24,7 @@
         packages = with pkgs; [
           zigpkgs."0.15.2"
           pkgs.bun
+          tree-sitter
         ];
       in {
         devShell = pkgs.mkShell {
