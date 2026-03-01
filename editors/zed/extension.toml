@@ -1,6 +1,6 @@
 id = "wren-lsp"
 name = "Wren"
-description = "Wren language support with wren-lsp integration."
+description = "wren-lsp language server integration for Wren."
 version = "0.0.1"
 schema_version = 1
 authors = ["Jossephus <jossephus@users.noreply.github.com>"]
@@ -10,6 +10,3 @@ repository = "https://github.com/jossephus/wren-lsp"
 name = "wren-lsp"
 languages = ["Wren"]
 
-[grammars.wren]
-repository = "https://github.com/jossephus/tree-sitter-wren"
-rev = "629c4f69c584bbbc113a9c13e6fd7b565c168f34"
