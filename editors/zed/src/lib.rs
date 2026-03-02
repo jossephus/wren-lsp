@@ -1,5 +1,5 @@
 use std::fs;
-use zed_extension_api::{self as zed, process, LanguageServerId, Result};
+use zed_extension_api::{self as zed, LanguageServerId, Result};
 
 struct WrenExtension {
     cached_binary_path: Option<String>,
@@ -84,20 +84,15 @@ impl WrenExtension {
         )
         .map_err(|e| format!("failed to download file: {e}"))?;
 
-        if !matches!(platform, zed::Os::Windows) {
-            zed::make_file_executable(&tmp_path)?;
-        }
+        zed::make_file_executable(&tmp_path)?;
 
         fs::rename(&tmp_path, binary_path).map_err(|e| format!("failed to install binary: {e}"))?;
         Ok(())
     }
 
-    fn is_system_binary_available(platform: zed::Os) -> bool {
+    fn system_binary_path(worktree: &zed::Worktree, platform: zed::Os) -> Option<String> {
         let binary_name = Self::binary_name(platform);
-        let mut command = process::Command::new(binary_name).arg("--version");
-        command
-            .output()
-            .is_ok_and(|output| output.status == Some(0))
+        worktree.which(binary_name)
     }
 
     fn try_update_existing_binary(
@@ -139,6 +134,7 @@ impl WrenExtension {
     fn language_server_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
+        worktree: &zed::Worktree,
     ) -> Result<String> {
         let (platform, arch) = zed::current_platform();
         let managed_binary_path = Self::binary_name(platform).to_string();
@@ -161,10 +157,10 @@ impl WrenExtension {
             return Ok(managed_binary_path);
         }
 
-        if Self::is_system_binary_available(platform) {
+        if let Some(system_binary_path) = Self::system_binary_path(worktree, platform) {
             self.cached_binary_path = None;
             self.has_checked_for_update = false;
-            return Ok(Self::binary_name(platform).to_string());
+            return Ok(system_binary_path);
         }
 
         zed::set_language_server_installation_status(
@@ -201,7 +197,7 @@ impl zed::Extension for WrenExtension {
         language_server_id: &LanguageServerId,
         _worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        let binary_path = self.language_server_binary_path(language_server_id)?;
+        let binary_path = self.language_server_binary_path(language_server_id, _worktree)?;
 
         Ok(zed::Command {
             command: binary_path,
