@@ -1,6 +1,6 @@
 [submodule "editors/sublime"]
 	path = editors/sublime
-	url = https://github.com/jossephus/LSP-wren-lsp
+	url = https://github.com/sublimelsp/LSP-wren-lsp.git
 [submodule "tree-sitter-wren"]
 	path = tree-sitter-wren
 	url = https://github.com/jossephus/tree-sitter-wren.git
